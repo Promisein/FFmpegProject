@@ -1,0 +1,20 @@
+﻿# Build directories
+cmake-build-*/
+build/
+
+# IDE files
+.idea/
+.vscode/
+
+# Executables and binaries
+*.exe
+*.dll
+*.pdb
+
+# FFmpeg prebuilt folder (optional, if you don't want to upload it)
+ffmpeg-4.4-full_build-shared/
+
+# Logs & temp
+*.log
+.DS_Store
+Thumbs.db
