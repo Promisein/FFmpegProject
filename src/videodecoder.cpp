@@ -11,6 +11,7 @@ extern "C" {
 }
 
 void video_decode_thread(AVCodecParameters* codec_par) {
+    std::cout << "start videoDecode!\n";
     const AVCodec* codec = avcodec_find_decoder(codec_par->codec_id);
     if (!codec) {
         std::cerr << "[Error] 找不到视频解码器" << std::endl;

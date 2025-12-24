@@ -13,14 +13,21 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
 }
+#include <windows.h>
+#include <io.h>
+#include <fcntl.h>
 
-int main(int argc, char* argv[]) {
+
+int main(int argc, char* argv[])
+{
+
+    SetConsoleOutputCP(CP_UTF8);  // 设置控制台输出为 UTF-8
 //    if (argc < 3) {
 //        std::cerr << "用法: " << argv[0] << " <输入文件> <输出文件>" << std::endl;
 //        return -1;
 //    }
     const char* input_file = "../input.mp4";
-    const char* output_file = "../ouput.mp4";
+    const char* output_file = "../output.mp4";
 
     // 初始化FFmpeg
     avformat_network_init();

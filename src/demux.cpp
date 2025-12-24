@@ -14,7 +14,7 @@ extern "C" {
 // 解封装线程实现
 void demux_thread(AVFormatContext* fmt_ctx, int video_stream_idx, int audio_stream_idx) {
     AVPacket pkt;
-    cout << "start demux!" << endl;
+    cout << "start demux!\n";
     // 循环读取媒体包
     while (av_read_frame(fmt_ctx, &pkt) >= 0) {
         if (pkt.stream_index == video_stream_idx) {
@@ -35,5 +35,5 @@ void demux_thread(AVFormatContext* fmt_ctx, int video_stream_idx, int audio_stre
     flush_pkt.size = 0;
     g_video_pkt_queue.push(flush_pkt);
     g_audio_pkt_queue.push(flush_pkt);
-    cout << "demux over!" << endl;
+    cout << "demux over!\n";
 }
