@@ -6,6 +6,7 @@
 #define FFMPEGPROJECT_MUX_H
 
 #include <string>
+#include "common.h"
 struct AVCodecParameters;
 
 // 复用线程（入参：输出文件路径、视频/音频编码参数）

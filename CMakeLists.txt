@@ -13,9 +13,9 @@ add_executable(FFmpegProject
         ${SRC_ROOT}/ring_buffer.cpp
         ${SRC_ROOT}/demux.cpp
         ${SRC_ROOT}/videodecoder.cpp
-        ${SRC_ROOT}/audiodecoder.cpp
+#        ${SRC_ROOT}/audiodecoder.cpp
         ${SRC_ROOT}/videoencoder.cpp
-        ${SRC_ROOT}/audioencoder.cpp
+#        ${SRC_ROOT}/audioencoder.cpp
         ${SRC_ROOT}/mux.cpp
 
 )

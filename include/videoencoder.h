@@ -5,6 +5,7 @@
 #ifndef FFMPEGPROJECT_VIDEOENCODER_H
 #define FFMPEGPROJECT_VIDEOENCODER_H
 #include "ring_buffer.h"
+#include "common.h"
 struct AVCodecParameters;
 
 // 视频编码线程（入参：原视频流参数、输出时间基）
