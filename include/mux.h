@@ -9,10 +9,11 @@
 #include "common.h"
 struct AVCodecParameters;
 
-// 复用线程（入参：输出文件路径、视频/音频编码参数）
+// 复用线程（入参：输出文件路径、视频/音频编码参数、输出时间基）
 void mux_thread(const std::string& output_file,
                 AVCodecParameters* video_enc_par,
-                AVCodecParameters* audio_enc_par);
+                AVCodecParameters* audio_enc_par,
+                AVRational output_time_base);
 
 
 #endif //FFMPEGPROJECT_MUX_H
