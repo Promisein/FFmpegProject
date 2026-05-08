@@ -9,6 +9,7 @@ set(SRC_ROOT ${CMAKE_SOURCE_DIR}/src)
 
 add_executable(FFmpegProject
         main.cpp
+        ${SRC_ROOT}/thread_pool.cpp
         ${SRC_ROOT}/pipeline.cpp
         ${SRC_ROOT}/common.cpp
         ${SRC_ROOT}/ring_buffer.cpp
@@ -18,7 +19,7 @@ add_executable(FFmpegProject
         ${SRC_ROOT}/videoencoder.cpp
         ${SRC_ROOT}/audioencoder.cpp
         ${SRC_ROOT}/mux.cpp
-#        ${SRC_ROOT}/video_rotate.cpp
+        ${SRC_ROOT}/video_rotate.cpp
 
 )
 

@@ -1,5 +1,10 @@
 #include <iostream>
 #include <thread>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <filesystem>
 #include "demux.h"
 #include "videodecoder.h"
 #include "audiodecoder.h"
@@ -8,6 +13,8 @@
 #include "mux.h"
 #include "pipeline.h"
 #include "ffmpeg_raii.h"
+#include "config.h"
+#include "thread_pool.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -16,88 +23,76 @@ extern "C" {
 }
 #include <windows.h>
 
-void verify_output_file(const std::string& filename) {
-    AVFormatContext* fmt_ctx = nullptr;
+namespace fs = std::filesystem;
 
-    if (avformat_open_input(&fmt_ctx, filename.c_str(), nullptr, nullptr) != 0) {
-        std::cerr << "[Verify] 无法打开文件: " << filename << "\n";
-        return;
-    }
+// ====================== 单文件转码任务 ======================
+struct TranscodeResult {
+    std::string filename;
+    bool success;
+    std::string error;
+    int video_frames = 0;
+    int audio_frames = 0;
+};
 
-    if (avformat_find_stream_info(fmt_ctx, nullptr) < 0) {
-        std::cerr << "[Verify] 无法获取流信息\n";
-        avformat_close_input(&fmt_ctx);
-        return;
-    }
+TranscodeResult transcode_single(const std::string& input_path,
+                                  const std::string& output_dir,
+                                  const ProcessingConfig& config) {
+    TranscodeResult result;
+    result.filename = input_path;
 
-    for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
-        AVStream* stream = fmt_ctx->streams[i];
-        AVCodecParameters* codecpar = stream->codecpar;
+    std::string output_file = output_dir + "/output.mp4";
 
-        std::cout << "[Verify] 流 #" << i << ": "
-                  << "codec_type=" << (codecpar->codec_type == AVMEDIA_TYPE_VIDEO ? "video" : "audio")
-                  << ", codec_id=" << codecpar->codec_id
-                  << " (" << avcodec_get_name(codecpar->codec_id) << ")"
-                  << ", codec_tag=0x" << std::hex << codecpar->codec_tag << std::dec
-                  << ", width=" << codecpar->width
-                  << ", height=" << codecpar->height << "\n";
-    }
-
-    avformat_close_input(&fmt_ctx);
-}
-
-int main(int argc, char* argv[]) {
-    SetConsoleOutputCP(CP_UTF8);
-
-    const char* input_file = "../input3.mp4";
-    const char* output_file = "../output.mp4";
-
-    avformat_network_init();
+    std::cout << "\n[Task] 开始转码: " << input_path << " -> " << output_file << "\n";
 
     // 打开输入文件
     AVFormatContext* fmt_ctx_raw = nullptr;
-    if (avformat_open_input(&fmt_ctx_raw, input_file, nullptr, nullptr) < 0) {
-        std::cerr << "[Error] 打开输入文件失败: " << input_file << "\n";
-        return -1;
+    if (avformat_open_input(&fmt_ctx_raw, input_path.c_str(), nullptr, nullptr) < 0) {
+        result.success = false;
+        result.error = "打开输入文件失败";
+        return result;
     }
     InputFormatContextPtr fmt_ctx(fmt_ctx_raw);
     if (avformat_find_stream_info(fmt_ctx.get(), nullptr) < 0) {
-        std::cerr << "[Error] 获取媒体流信息失败\n";
-        return -1;
+        result.success = false;
+        result.error = "获取媒体流信息失败";
+        return result;
     }
 
-    // 查找视频流、音频流索引
+    // 查找流索引
     int video_stream_idx = -1, audio_stream_idx = -1;
     for (unsigned int i = 0; i < fmt_ctx->nb_streams; i++) {
-        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
             video_stream_idx = i;
-        } else if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+        else if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
             audio_stream_idx = i;
-        }
     }
     if (video_stream_idx == -1 || audio_stream_idx == -1) {
-        std::cerr << "[Error] 未找到视频/音频流\n";
-        return -1;
+        result.success = false;
+        result.error = "未找到视频/音频流";
+        return result;
     }
 
     AVCodecParameters* video_dec_par = fmt_ctx->streams[video_stream_idx]->codecpar;
     AVCodecParameters* audio_dec_par = fmt_ctx->streams[audio_stream_idx]->codecpar;
 
-    // 创建MPEG4编码参数
+    // 确定输出分辨率
+    int out_width = video_dec_par->width;
+    int out_height = video_dec_par->height;
+    if (config.rotate == ROTATE_90_CW || config.rotate == ROTATE_270_CW) {
+        std::swap(out_width, out_height);
+    }
+
+    // MPEG4 编码参数
     CodecParametersPtr mpeg4_params(avcodec_parameters_alloc());
     mpeg4_params->codec_type = AVMEDIA_TYPE_VIDEO;
     mpeg4_params->codec_id = AV_CODEC_ID_MPEG4;
     mpeg4_params->codec_tag = 0x7634706d;
-    mpeg4_params->width = video_dec_par->width;
-    mpeg4_params->height = video_dec_par->height;
+    mpeg4_params->width = out_width;
+    mpeg4_params->height = out_height;
     mpeg4_params->format = AV_PIX_FMT_YUV420P;
     mpeg4_params->bit_rate = 1000000;
 
-    std::cout << "[Main] 创建MPEG4编码参数: codec_id=" << mpeg4_params->codec_id
-              << ", codec_tag=0x" << std::hex << mpeg4_params->codec_tag << std::dec
-              << ", 分辨率=" << mpeg4_params->width << "x" << mpeg4_params->height << "\n";
-
-    // 创建AC3编码参数
+    // AC3 编码参数
     CodecParametersPtr ac3_params(avcodec_parameters_alloc());
     ac3_params->codec_type = AVMEDIA_TYPE_AUDIO;
     ac3_params->codec_id = AV_CODEC_ID_AC3;
@@ -107,32 +102,23 @@ int main(int argc, char* argv[]) {
     ac3_params->format = AV_SAMPLE_FMT_FLTP;
     ac3_params->bit_rate = 128000;
 
-    std::cout << "[Main] 创建AC3编码参数: codec_id=" << ac3_params->codec_id
-              << ", 采样率=" << ac3_params->sample_rate
-              << ", 声道数=" << ac3_params->channels << "\n";
-
-    // 获取输出时间基
+    // 输出时间基
     AVRational input_frame_rate = fmt_ctx->streams[video_stream_idx]->r_frame_rate;
     if (input_frame_rate.num == 0 || input_frame_rate.den == 0) {
         input_frame_rate = (AVRational){25, 1};
     }
     AVRational output_time_base = av_inv_q(input_frame_rate);
-    std::cout << "[Main] 输入视频帧率: " << input_frame_rate.num << "/" << input_frame_rate.den
-              << " (" << av_q2d(input_frame_rate) << "fps)\n";
-    std::cout << "[Main] 输出时间基: " << output_time_base.num << "/" << output_time_base.den << "\n";
 
-    // ====================== 创建 Pipeline（管理所有队列） ======================
+    // 创建独立的 Pipeline（每个任务有自己的一套队列）
     Pipeline pipeline;
 
-    // ====================== 创建所有线程 ======================
-    // 1. 解封装线程
+    // 启动 6 个转码线程
     std::thread demux_th(demux_thread,
                          fmt_ctx.get(), video_stream_idx, audio_stream_idx,
                          std::ref(pipeline.video_pkt_queue),
                          std::ref(pipeline.audio_pkt_queue),
                          &pipeline);
 
-    // 2. 解码线程
     std::thread video_dec_th(video_decode_thread, video_dec_par,
                              std::ref(pipeline.video_pkt_queue),
                              std::ref(pipeline.video_frame_ringbuf),
@@ -142,24 +128,22 @@ int main(int argc, char* argv[]) {
                              std::ref(pipeline.audio_frame_ringbuf),
                              &pipeline);
 
-    // 3. 编码线程
     std::thread video_enc_th(video_encode_thread, video_dec_par, output_time_base,
                              std::ref(pipeline.video_frame_ringbuf),
                              std::ref(pipeline.en_video_pkt_queue),
-                             &pipeline);
+                             config, &pipeline);
     std::thread audio_enc_th(audio_encode_thread, audio_dec_par, output_time_base,
                              std::ref(pipeline.audio_frame_ringbuf),
                              std::ref(pipeline.en_audio_pkt_queue),
-                             &pipeline);
+                             config, &pipeline);
 
-    // 4. 复用线程
-    std::thread mux_th(mux_thread, std::string(output_file),
+    std::thread mux_th(mux_thread, output_file,
                        mpeg4_params.get(), ac3_params.get(), output_time_base,
                        std::ref(pipeline.en_video_pkt_queue),
                        std::ref(pipeline.en_audio_pkt_queue),
-                       &pipeline);
+                       config, &pipeline);
 
-    // ====================== 等待线程结束 ======================
+    // 等待当前任务的所有线程完成
     demux_th.join();
     video_dec_th.join();
     audio_dec_th.join();
@@ -167,17 +151,155 @@ int main(int argc, char* argv[]) {
     audio_enc_th.join();
     mux_th.join();
 
-    // 检查是否有错误
     if (pipeline.has_error()) {
-        std::cerr << "[Main Error] 转码过程中发生错误: " << pipeline.get_error() << "\n";
+        result.success = false;
+        result.error = pipeline.get_error();
+        return result;
+    }
+
+    result.success = true;
+    std::cout << "[Task] 完成: " << input_path << "\n";
+    return result;
+}
+
+// ====================== 打印用法 ======================
+void print_usage(const char* prog) {
+    std::cout << "用法: " << prog << " [-rotate <angle>] [-speed <ratio>] [-threads <n>]\n"
+              << "  -rotate <angle>  视频旋转: 90, 180, 270\n"
+              << "  -speed  <ratio>  播放速度: 0.5, 0.75, 1.25, 1.5, 2, 4\n"
+              << "  -threads <n>     线程池并发数（默认 3）\n"
+              << "\n"
+              << "自动扫描 ../input/*.mp4，输出到 ../output/<文件名>/\n"
+              << "示例: " << prog << " -rotate 90 -speed 1.5 -threads 4\n";
+}
+
+// ====================== 主函数 ======================
+int main(int argc, char* argv[]) {
+    SetConsoleOutputCP(CP_UTF8);
+
+    // 解析 CLI
+    ProcessingConfig config;
+    int pool_size = 3;  // 默认并发 3 个任务
+
+    for (int i = 1; i < argc; i++) {
+        if (std::strcmp(argv[i], "-rotate") == 0 && i + 1 < argc) {
+            int angle = std::stoi(argv[++i]);
+            if (angle == 90)       config.rotate = ROTATE_90_CW;
+            else if (angle == 180) config.rotate = ROTATE_180;
+            else if (angle == 270) config.rotate = ROTATE_270_CW;
+            else {
+                std::cerr << "[Error] 不支持的旋转角度: " << angle << "\n";
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "-speed") == 0 && i + 1 < argc) {
+            config.speed_ratio = std::stod(argv[++i]);
+            if (config.speed_ratio <= 0) {
+                std::cerr << "[Error] 倍速值必须 > 0\n";
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "-threads") == 0 && i + 1 < argc) {
+            pool_size = std::stoi(argv[++i]);
+            if (pool_size < 1) pool_size = 1;
+        } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        } else {
+            std::cerr << "[Error] 未知参数: " << argv[i] << "\n";
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
+
+    std::cout << "[Main] 配置: 旋转=" << config.rotate
+              << "度, 倍速=" << config.speed_ratio
+              << "x, 线程池=" << pool_size << "\n";
+
+    avformat_network_init();
+
+    // 扫描 input/ 目录
+    std::string input_dir = "../input";
+    std::string output_base = "../output";
+    std::vector<std::string> input_files;
+
+    try {
+        for (const auto& entry : fs::directory_iterator(input_dir)) {
+            if (!entry.is_regular_file()) continue;
+            std::string ext = entry.path().extension().string();
+            if (ext == ".mp4" || ext == ".MP4") {
+                input_files.push_back(entry.path().string());
+            }
+        }
+    } catch (const fs::filesystem_error& e) {
+        std::cerr << "[Error] 扫描输入目录失败: " << e.what() << "\n";
         return -1;
     }
 
-    // 验证输出
-    verify_output_file(std::string(output_file));
+    // 排序保证处理顺序一致
+    std::sort(input_files.begin(), input_files.end());
+
+    if (input_files.empty()) {
+        std::cerr << "[Error] 在 " << input_dir << " 未找到 .mp4 文件\n";
+        return -1;
+    }
+
+    std::cout << "[Main] 扫描到 " << input_files.size() << " 个视频文件\n";
+
+    // 限制线程池大小不超过文件数
+    if (pool_size > static_cast<int>(input_files.size())) {
+        pool_size = static_cast<int>(input_files.size());
+    }
+
+    // 创建线程池
+    ThreadPool pool(pool_size);
+
+    // 存储结果
+    std::vector<TranscodeResult> results(input_files.size());
+
+    // 对每个输入文件提交任务
+    for (size_t i = 0; i < input_files.size(); i++) {
+        std::string filepath = input_files[i];
+
+        // 提取文件名（不含扩展名）
+        fs::path p(filepath);
+        std::string stem = p.stem().string();
+
+        // 创建输出子目录
+        std::string output_dir = output_base + "/" + stem;
+        try {
+            fs::create_directories(output_dir);
+        } catch (const fs::filesystem_error& e) {
+            std::cerr << "[Error] 创建输出目录失败: " << output_dir << "\n";
+            results[i].success = false;
+            results[i].error = e.what();
+            continue;
+        }
+
+        pool.submit([filepath, output_dir, config, &results, i]() {
+            results[i] = transcode_single(filepath, output_dir, config);
+        });
+    }
+
+    // 等待所有任务完成
+    std::cout << "[Main] 已提交 " << pool.total_submitted() << " 个任务，等待完成...\n";
+    pool.wait_all();
+    std::cout << "[Main] 所有任务已完成\n\n";
+
+    // 打印结果汇总
+    int success_count = 0, fail_count = 0;
+    std::cout << "========== 转码结果汇总 ==========\n";
+    for (size_t i = 0; i < results.size(); i++) {
+        const auto& r = results[i];
+        if (r.success) {
+            std::cout << "  [OK]    " << r.filename << "\n";
+            success_count++;
+        } else {
+            std::cout << "  [FAIL]  " << r.filename << " - " << r.error << "\n";
+            fail_count++;
+        }
+    }
+    std::cout << "成功: " << success_count << ", 失败: " << fail_count
+              << ", 总计: " << results.size() << "\n";
 
     avformat_network_deinit();
-    // RAII: fmt_ctx, mpeg4_params, ac3_params 自动释放
-
-    return 0;
+    return fail_count > 0 ? 1 : 0;
 }

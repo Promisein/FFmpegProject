@@ -11,20 +11,42 @@ cmake --build .
 
 # DLLs must be on PATH at runtime:
 PATH="C:/Users/Jianing/Desktop/C++Project/FFmpegProject/ffmpeg-4.4-full_build-shared/bin:$PATH" \
-  ./FFmpegProject.exe
+  ./FFmpegProject ../input/input3.mp4 ../output/output.mp4 -rotate 90 -speed 1.5
 ```
 
 The project requires FFmpeg 4.4 shared libraries. Update `FFMPEG_ROOT` in `CMakeLists.txt:7` if the path differs in your environment.
 
 No tests or linter are configured.
 
-## Architecture: 6-thread transcode pipeline
+## CLI Usage
+
+```
+FFmpegProject <input> <output> [-rotate <angle>] [-speed <ratio>]
+  -rotate <angle>  视频旋转: 90, 180, 270
+  -speed  <ratio>  播放速度: 0.5, 0.75, 1.25, 1.5, 2, 4
+```
+
+## Architecture: 6-thread transcode pipeline with in-encoder processing
 
 ```
 Input → [Demux] → PacketQueue → [Decoder ×2] → RingBuffer → [Encoder ×2] → DeepCopyPacketQueue → [Mux] → Output MP4
+                                                              │
+                                          pop frame → [旋转] → [倍速 drop/dup] → encode
 ```
 
 Each stage is a `std::thread` launched from `main.cpp`. Threads communicate exclusively through queues owned by a **`Pipeline`** object — there are no global queues.
+
+### Processing modules
+
+Two optional processing modules execute inside the encoder threads (between `RingBuffer::pop()` and `avcodec_send_frame()`):
+
+- **Video rotation** (`src/video_rotate.cpp`): `VideoRotateProcessor` class rotates YUV420P frames 90/180/270 degrees. 90/270 swaps encoder output width/height.
+- **Speed change** (`src/videoencoder.cpp:85-105`, `src/audioencoder.cpp:115-128`):
+  - Fast (>1x): frame dropping (both video and audio)
+  - Slow (<1x): frame duplication (both video and audio)
+  - A/V sync maintained via consecutive PTS values — no muxer-level adjustment needed
+
+Config struct (`include/config.h`) carries `VideoRotateAngle rotate` and `double speed_ratio` across thread boundaries.
 
 ### Pipeline class (`include/pipeline.h`, `src/pipeline.cpp`)
 
@@ -42,7 +64,7 @@ All FFmpeg C resources are managed via `std::unique_ptr` with custom deleters:
 | `PacketPtr` | `AVPacket*` | `av_packet_free` |
 | `CodecParametersPtr` | `AVCodecParameters*` | `avcodec_parameters_free` |
 
-Error paths in thread functions are simple `return` — RAII handles all cleanup automatically, eliminating the manual `goto`-style resource freeing scattered across the old code.
+Error paths in thread functions are simple `return` — RAII handles all cleanup automatically.
 
 ### Queue implementations
 
@@ -67,11 +89,7 @@ Error paths in thread functions are simple `return` — RAII handles all cleanup
 
 The muxer recalculates audio PTS from an accumulated sample counter (does not trust encoder PTS) and uses a min-heap (`std::priority_queue` + `PacketComparator`) to interleave packets in correct presentation order.
 
-### Video rotate module (not linked)
-
-`src/video_rotate.cpp` implements YUV420P 90/180/270-degree rotation. Commented out in `CMakeLists.txt`. Not part of the active build.
-
 ## Common pitfalls
 
 - Audio encoder assumes input is FLTP. If the decoder outputs a different sample format, encoding fails — no `swresample` conversion.
-- Input/output paths are hardcoded in `main.cpp` as `../input3.mp4` / `../output.mp4` (relative to build directory).
+- The audio encoder must NOT call `av_packet_rescale_ts` on output packets — the muxer recalculates audio PTS from accumulated samples, and rescaling corrupts the packet duration.

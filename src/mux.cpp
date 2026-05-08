@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <thread>
+#include <cmath>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -33,6 +34,7 @@ void mux_thread(const std::string& output_file,
                 AVRational output_time_base,
                 DeepCopyPacketQueue& video_q,
                 DeepCopyPacketQueue& audio_q,
+                const ProcessingConfig& config,
                 Pipeline* pipeline) {
     std::cout << "[Mux] 开始创建输出文件: " << output_file << "\n";
 
@@ -45,7 +47,6 @@ void mux_thread(const std::string& output_file,
         return;
     }
 
-    // RAII-style cleanup for output format context
     auto cleanup_output = [&](AVFormatContext* ctx) {
         if (ctx) {
             if (!(ctx->oformat->flags & AVFMT_NOFILE) && ctx->pb) {
@@ -150,9 +151,8 @@ void mux_thread(const std::string& output_file,
                     video_packet_count++;
 
                     if (video_packet_count % 100 == 0) {
-                        auto* top = packet_queue.empty() ? nullptr : packet_queue.top();
-                        std::cout << "[Mux Debug] 视频包: pts=" << (top ? top->pts : -1)
-                                  << " (" << (top ? (double)top->pts * video_stream->time_base.num / video_stream->time_base.den : 0) << "秒)\n";
+                        std::cout << "[Mux Debug] 视频包: pts=" << (packet_queue.empty() ? -1 : packet_queue.top()->pts)
+                                  << "\n";
                     }
                 } else {
                     video_done = true;
@@ -181,9 +181,8 @@ void mux_thread(const std::string& output_file,
                     audio_packet_count++;
 
                     if (audio_packet_count % 100 == 0) {
-                        auto* top = packet_queue.empty() ? nullptr : packet_queue.top();
-                        std::cout << "[Mux Debug] 音频包: pts=" << (top ? top->pts : -1)
-                                  << ", 累计样本=" << audio_accumulated_samples << "\n";
+                        std::cout << "[Mux Debug] 音频包: pts=" << (packet_queue.empty() ? -1 : packet_queue.top()->pts)
+                                  << ", 累计=" << audio_accumulated_samples << "\n";
                     }
                 } else {
                     audio_done = true;
@@ -228,7 +227,7 @@ void mux_thread(const std::string& output_file,
     std::cout << "[Mux] 完成！文件: " << output_file
               << "，视频包: " << video_packet_count
               << "，音频包: " << audio_packet_count
-              << "，音频总样本数: " << audio_accumulated_samples << "\n";
+              << "，音频累计: " << audio_accumulated_samples << "\n";
 
     cleanup_output(out_fmt_ctx_raw);
 }
