@@ -12,10 +12,6 @@
 struct AVFormatContext;
 struct AVCodecParameters;
 struct AVFrame;
-
-// 全局队列声明（仅声明，定义在common.cpp）
-extern PacketQueue<AVPacket> g_video_pkt_queue;
-extern PacketQueue<AVPacket> g_audio_pkt_queue;
-extern DeepCopyPacketQueue g_en_video_pkt_queue;
-extern DeepCopyPacketQueue g_en_audio_pkt_queue;
+struct AVRational;
+class Pipeline;
 #endif //FFMPEGPROJECT_COMMON_H

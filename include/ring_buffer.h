@@ -207,8 +207,5 @@ public:
     }
 };
 
-// 全局环形缓冲区声明（按需调整类型/容量）
-extern RingBuffer<AVFrame*> g_video_frame_ringbuf;
-extern RingBuffer<AVFrame*> g_audio_frame_ringbuf;
 
 #endif //FFMPEGPROJECT_RING_BUFFER_H

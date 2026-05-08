@@ -2,7 +2,8 @@
 // Created by Jianing on 2025/12/22.
 //
 #include "audiodecoder.h"
-#include "ring_buffer.h"
+#include "pipeline.h"
+#include "ffmpeg_raii.h"
 #include <iostream>
 #include <fstream>
 
@@ -34,29 +35,20 @@ public:
     }
 
     void write_frame(AVFrame* frame) {
-        if (!pcm_file.is_open() || !frame || !frame->data[0]) {
-            return;
-        }
-
-        // 获取音频帧信息
+        if (!pcm_file.is_open() || !frame || !frame->data[0]) return;
         int channels = frame->channels;
         int samples_per_channel = frame->nb_samples;
         int bytes_per_sample = av_get_bytes_per_sample(static_cast<AVSampleFormat>(frame->format));
-
         if (av_sample_fmt_is_planar(static_cast<AVSampleFormat>(frame->format))) {
-            // Planar格式：每个声道的数据分开存储
             for (int ch = 0; ch < channels; ch++) {
                 pcm_file.write(reinterpret_cast<char*>(frame->data[ch]),
                               samples_per_channel * bytes_per_sample);
             }
         } else {
-            // Interleaved格式：所有声道数据交错存储
             pcm_file.write(reinterpret_cast<char*>(frame->data[0]),
                           samples_per_channel * channels * bytes_per_sample);
         }
-
         frame_count++;
-        // PCM 写入日志：每50帧输出一次（音频帧通常比视频帧多）
         if (frame_count % 100 == 0) {
             std::cout << "[PCM] 已写入 " << frame_count << " 帧到PCM文件\n";
         }
@@ -69,13 +61,14 @@ public:
         }
     }
 
-    ~PCMFileWriter() {
-        close();
-    }
+    ~PCMFileWriter() { close(); }
 };
 #endif
 
-void audio_decode_thread(AVCodecParameters* codec_par) {
+void audio_decode_thread(AVCodecParameters* codec_par,
+                         PacketQueue<AVPacket>& in_queue,
+                         RingBuffer<AVFrame*>& out_rb,
+                         Pipeline* pipeline) {
 
 #if ENABLE_PCM_OUTPUT
     PCMFileWriter pcm_writer;
@@ -86,48 +79,42 @@ void audio_decode_thread(AVCodecParameters* codec_par) {
 
     const AVCodec* codec = avcodec_find_decoder(codec_par->codec_id);
     if (!codec) {
-        std::cerr << "[Error] 找不到音频解码器\n";
+        if (pipeline) pipeline->report_error("[AudioDecoder] 找不到音频解码器");
         return;
     }
 
-    AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
+    CodecContextPtr codec_ctx(avcodec_alloc_context3(codec));
     if (!codec_ctx) {
-        std::cerr << "[Error] 分配音频解码器上下文失败\n";
+        if (pipeline) pipeline->report_error("[AudioDecoder] 分配音频解码器上下文失败");
         return;
     }
-    if (avcodec_parameters_to_context(codec_ctx, codec_par) < 0) {
-        std::cerr << "[Error] 复制音频流参数失败\n";
-        avcodec_free_context(&codec_ctx);
+    if (avcodec_parameters_to_context(codec_ctx.get(), codec_par) < 0) {
+        if (pipeline) pipeline->report_error("[AudioDecoder] 复制音频流参数失败");
         return;
     }
-
-    if (avcodec_open2(codec_ctx, codec, nullptr) < 0) {
-        std::cerr << "[Error] 打开音频解码器失败\n";
-        avcodec_free_context(&codec_ctx);
+    if (avcodec_open2(codec_ctx.get(), codec, nullptr) < 0) {
+        if (pipeline) pipeline->report_error("[AudioDecoder] 打开音频解码器失败");
         return;
     }
 
     AVPacket pkt;
-    AVFrame* frame = av_frame_alloc();
-    int frame_count = 0;  // 👈 新增帧计数器
+    FramePtr frame(av_frame_alloc());
+    int frame_count = 0;
 
-    while (g_audio_pkt_queue.pop(pkt)) {
-        if (!pkt.data) { // 空Packet：解码结束
-            avcodec_send_packet(codec_ctx, nullptr);
+    while (in_queue.pop(pkt)) {
+        if (!pkt.data) {
+            avcodec_send_packet(codec_ctx.get(), nullptr);
             break;
         }
 
-        if (avcodec_send_packet(codec_ctx, &pkt) < 0) {
+        if (avcodec_send_packet(codec_ctx.get(), &pkt) < 0) {
             std::cerr << "[Warn] 音频Packet发送失败\n";
             av_packet_unref(&pkt);
             continue;
         }
 
-        // 接收解码帧 → 推入环形缓冲区
-        while (avcodec_receive_frame(codec_ctx, frame) >= 0) {
-            frame_count++;  // 👈 计数递增
-
-            // 🔁 高频日志：每50帧才输出（音频帧通常比视频帧多）
+        while (avcodec_receive_frame(codec_ctx.get(), frame.get()) >= 0) {
+            frame_count++;
             if (frame_count % 100 == 0) {
                 std::cout << "[Audio Decode Info] 解码PCM帧: pts=" << frame->pts
                           << " channels=" << frame->channels
@@ -137,33 +124,20 @@ void audio_decode_thread(AVCodecParameters* codec_par) {
             }
 
 #if ENABLE_PCM_OUTPUT
-            // 只支持部分PCM格式输出
             if (frame->format == AV_SAMPLE_FMT_S16P ||
                 frame->format == AV_SAMPLE_FMT_S16 ||
                 frame->format == AV_SAMPLE_FMT_FLTP ||
                 frame->format == AV_SAMPLE_FMT_FLT) {
-                pcm_writer.write_frame(frame);
-            } else {
-                // 非标准PCM格式提示
-                if (frame_count % 50 == 0) {
-                    std::cout << "[Info] 不支持格式(" << frame->format
-                              << ")的PCM输出，跳过文件写入\n";
-                }
+                pcm_writer.write_frame(frame.get());
             }
 #endif
-
-            // 推入音频Frame环形缓冲区
-            g_audio_frame_ringbuf.push(frame);
-            av_frame_unref(frame);
+            out_rb.push(frame.get());
+            av_frame_unref(frame.get());
         }
         av_packet_unref(&pkt);
     }
 
-    // 解码结束：发送刷新信号给编码线程
-    g_audio_frame_ringbuf.flush();
-    av_frame_free(&frame);
-    avcodec_free_context(&codec_ctx);
-
-    // 结束信息
+    out_rb.flush();
     std::cout << "[AudioDecoder Info] 音频解码线程退出，共处理 " << frame_count << " 帧\n";
+    // RAII: codec_ctx, frame 自动释放
 }

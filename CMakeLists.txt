@@ -4,11 +4,12 @@ project(FFmpegProject)
 set(CMAKE_CXX_STANDARD 17)
 
 # 定义 FFmpeg 路径
-set(FFMPEG_ROOT "C:/Users/Jianing/Desktop/FFmpegProject/ffmpeg-4.4-full_build-shared")
+set(FFMPEG_ROOT "C:/Users/Jianing/Desktop/C++Project/FFmpegProject/ffmpeg-4.4-full_build-shared")
 set(SRC_ROOT ${CMAKE_SOURCE_DIR}/src)
 
 add_executable(FFmpegProject
         main.cpp
+        ${SRC_ROOT}/pipeline.cpp
         ${SRC_ROOT}/common.cpp
         ${SRC_ROOT}/ring_buffer.cpp
         ${SRC_ROOT}/demux.cpp

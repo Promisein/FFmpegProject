@@ -1,10 +1,5 @@
 //
 // Created by Jianing on 2025/12/22.
 //
-#include "common.h"
-
-// 全局队列的唯一定义（避免重复定义）
-PacketQueue<AVPacket> g_video_pkt_queue;
-PacketQueue<AVPacket> g_audio_pkt_queue;
-DeepCopyPacketQueue g_en_video_pkt_queue;
-DeepCopyPacketQueue g_en_audio_pkt_queue;
+// Global queues have been moved to Pipeline class (include/pipeline.h).
+// This file is intentionally empty — kept for future shared utilities.
