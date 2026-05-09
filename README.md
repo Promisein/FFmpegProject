@@ -25,62 +25,174 @@
 ### 项目架构
 
 ```
-                        ┌──────────────────────────┐
-                        │       main.cpp            │
-                        │  解析 CLI · 扫描 input/   │
-                        │  创建 ThreadPool · 汇总   │
-                        └──────────┬───────────────┘
-                                   │ submit N tasks
-                                   ▼
-                ┌──────────────────────────────────────┐
-                │         ThreadPool (上层并发)         │
-                │   pool_size = 3, 手写 std::queue +    │
-                │   mutex + CV + atomic 计数器          │
-                ├──────┬──────┬──────┬──────────────────┤
-                │ Wkr1 │ Wkr2 │ Wkr3 │  ...             │
-                └──┬───┴──┬───┴──┬───┘                  │
-                   │      │      │                      │
-                   ▼      ▼      ▼                      │
-             transcode_single() × N                     │
-        (每个任务内部 6 线程独立 Pipeline)                │
-└──────────────────────────────────────────────────────┘
+╔═══════════════════════════════════════════════════════════════════════════════════════╗
+║                           FFmpegProject 整体架构 (两层级线程模型)                        ║
+╚═══════════════════════════════════════════════════════════════════════════════════════╝
 
-        ┌─────────────────────────────────────────┐
-        │  transcode_single() — 6 线程转码管线     │
-        │                                         │
-        │  ┌────────┐   PacketQueue   ┌─────────┐ │
-        │  │①Demux  │────────────────▶│②Vid Dec │──┐
-        │  │ 解封装 │                 │ H.264→  │  │
-        │  └───┬────┘                 │ YUV420P │  │  RingBuffer(30)
-        │      │                      └─────────┘  │
-        │      │          ┌─────────┐              │
-        │      │          │③Aud Dec │              │
-        │      └─────────▶│ AAC→FLTP│              │
-        │    PacketQueue   └────┬────┘              │
-        │                      │ RingBuffer(30)    │
-        │                      │                   │
-        │  ┌────────────────────▼─────────────────┐│
-        │  │           ④ Video Encoder            ││
-        │  │  pop → [VideoRotate 90/180/270]     ││
-        │  │      → [Speed drop/dup ×0.5~×4]     ││
-        │  │      → avcodec_send_frame (MPEG4)   ││
-        │  └────────────────────┬─────────────────┘│
-        │                       │ DeepCopyPktQueue │
-        │  ┌────────────────────▼─────────────────┐│
-        │  │           ⑤ Audio Encoder            ││
-        │  │  pop → [Speed drop/dup ×0.5~×4]     ││
-        │  │      → avcodec_send_frame (AC3)     ││
-        │  └────────────────────┬─────────────────┘│
-        │                       │ DeepCopyPktQueue │
-        │                       ▼                  │
-        │  ┌──────────────────────────────────────┐│
-        │  │            ⑥ Muxer                    ││
-        │  │  min-heap PTS interleave             ││
-        │  │  → av_interleaved_write_frame()      ││
-        │  └──────────────────┬───────────────────┘│
-        │                     ▼                    │
-        │              ../output/<name>/output.mp4  │
-        └─────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐     ┌──────────────────────────┐
+│                   main.cpp                       │     │   ProcessingConfig        │
+│                                                  │     │   ┌─────────────────┐    │
+│  ① 解析 CLI 参数                                  │     │   │ rotate: 90|180|270│   │
+│     -rotate / -speed / -threads                  │◀────│   │ speed:  0.5~4    │    │
+│                                                  │     │   └─────────────────┘    │
+│  ② 扫描 ../input/*.mp4 → 生成文件列表              │     └──────────────────────────┘
+│                                                  │
+│  ③ 创建 ThreadPool(pool_size)                    │
+│     │                                            │
+│     │  for each file: pool.submit(task)          │
+│     │                                            │
+│     │  pool.wait_all() → 打印结果汇总              │
+│     └────────────────┬───────────────────────────┘
+│                      │
+│                      │ submit N 个转码任务
+│                      ▼
+│  ┌───────────────────────────────────────────────────────────────────────────────┐
+│  │                         ThreadPool (上层 — 任务级并发)                          │
+│  │                                                                               │
+│  │  std::vector<thread> workers_        ┌──────────┐                              │
+│  │  std::queue<function> tasks_         │ Worker 1 │──▶ transcode_single(A.mp4)  │
+│  │  mutex + condition_variable          ├──────────┤                              │
+│  │  atomic<size_t> active_count_        │ Worker 2 │──▶ transcode_single(B.mp4)  │
+│  │  atomic<size_t> total_submitted_     ├──────────┤                              │
+│  │  atomic<size_t> total_completed_     │ Worker 3 │──▶ transcode_single(C.mp4)  │
+│  │                                       └──────────┘                              │
+│  │  每个 Worker 循环: wait task → execute → notify done_cv_                        │
+│  └───────────────────────────────────────────────────────────────────────────────┘
+│                      │
+│                      │ 每个 Worker 内部启动独立的 6 线程管道
+│                      ▼
+│  ┌───────────────────────────────────────────────────────────────────────────────┐
+│  │              transcode_single() (下层 — 单文件 6 线程转码管线)                    │
+│  │                                                                               │
+│  │  ◆ 每个调用创建独立的 Pipeline 实例 (所有队列 + 错误传播)                          │
+│  │  ◆ 全部 FFmpeg 资源由 RAII 包装, 异常安全                                        │
+│  │                                                                               │
+│  │  ┌─────────────────────────────────────────────────────────────────────────┐  │
+│  │  │                         Pipeline (队列容器 + 错误广播)                      │  │
+│  │  │                                                                         │  │
+│  │  │  ┌──────────────────┐  ┌──────────────────┐  ┌─────────────────────┐   │  │
+│  │  │  │ video_pkt_queue  │  │ audio_pkt_queue  │  │ error_flag_ (atomic)│   │  │
+│  │  │  │ PacketQueue      │  │ PacketQueue      │  │ error_msg_ (mutex)  │   │  │
+│  │  │  └────────┬─────────┘  └────────┬─────────┘  └─────────────────────┘   │  │
+│  │  │           │                     │                                       │  │
+│  │  │  ┌────────▼─────────────────────▼──────────┐                            │  │
+│  │  │  │ video_frame_ringbuf │ audio_frame_ringbuf│  RingBuffer<AVFrame*>(30) │  │
+│  │  │  └────────┬────────────────────┬───────────┘                            │  │
+│  │  │           │                    │                                        │  │
+│  │  │  ┌────────▼────────────────────▼───────────┐                            │  │
+│  │  │  │ en_video_pkt_queue │ en_audio_pkt_queue │  DeepCopyPacketQueue      │  │
+│  │  │  └─────────────────────────────────────────┘                            │  │
+│  │  └─────────────────────────────────────────────────────────────────────────┘  │
+│  │                                                                               │
+│  │                        ┌─ 6 线程数据流 ─┐                                       │
+│  │                                                                               │
+│  │  ┌──────────┐  视频 PacketQueue    ┌──────────────┐                             │
+│  │  │ ① Demux  │─────────────────────▶│ ② Video Dec  │──┐                          │
+│  │  │          │                      │              │  │ 视频 RingBuffer(30)      │
+│  │  │ av_read  │  音频 PacketQueue    └──────────────┘  │                          │
+│  │  │ _frame() │──┐                                      │                          │
+│  │  └──────────┘  │                ┌──────────────┐      │                          │
+│  │                └───────────────▶│ ③ Audio Dec  │──┐   │                          │
+│  │                                 │              │  │   │ 音频 RingBuffer(30)      │
+│  │                                 └──────────────┘  │   │                          │
+│  │                                                    │   │                          │
+│  │  ┌─────────────────────────────────────────────────▼───▼──────────────────────┐ │
+│  │  │                      ④ Video Encoder (编码线程内处理)                        │ │
+│  │  │                                                                           │ │
+│  │  │   RingBuffer.pop()                                                        │ │
+│  │  │        │                                                                  │ │
+│  │  │        ▼                                                                  │ │
+│  │  │   ┌──────────────┐                                                        │ │
+│  │  │   │ VideoRotate  │  YUV420P 像素级旋转 (90°/180°/270°)                     │ │
+│  │  │   │ Processor    │  90°/270° 时交换编码器宽高                               │ │
+│  │  │   └──────┬───────┘                                                        │ │
+│  │  │          ▼                                                                │ │
+│  │  │   ┌──────────────┐                                                        │ │
+│  │  │   │ Speed Change │  >1x: 帧丢弃    <1x: 帧复制                             │ │
+│  │  │   │ (drop/dup)   │  PTS 连续自增, 无需封装层额外调整                        │ │
+│  │  │   └──────┬───────┘                                                        │ │
+│  │  │          ▼                                                                │ │
+│  │  │   avcodec_send_frame() ──▶ avcodec_receive_packet()                       │ │
+│  │  │          │                        │                                       │ │
+│  │  │          │           ┌────────────▼──────────────┐                        │ │
+│  │  │          │           │ DeepCopyPacketQueue (视频) │                        │ │
+│  │  │          │           │ av_packet_clone 深拷贝     │                        │ │
+│  │  │          │           └────────────┬──────────────┘                        │ │
+│  │  └──────────│────────────────────────│───────────────────────────────────────┘ │
+│  │             │                        │                                          │
+│  │  ┌──────────▼────────────────────────▼───────────────────────────────────────┐ │
+│  │  │                      ⑤ Audio Encoder (编码线程内处理)                       │ │
+│  │  │                                                                           │ │
+│  │  │   RingBuffer.pop()                                                        │ │
+│  │  │        │                                                                  │ │
+│  │  │        ▼                                                                  │ │
+│  │  │   ┌──────────────┐                                                        │ │
+│  │  │   │ Speed Change │  >1x: 帧丢弃    <1x: 帧复制                             │ │
+│  │  │   │ (drop/dup)   │  AC3 固定 1536 采样/帧                                  │ │
+│  │  │   └──────┬───────┘                                                        │ │
+│  │  │          ▼                                                                │ │
+│  │  │   avcodec_send_frame() ──▶ avcodec_receive_packet()                       │ │
+│  │  │          │                        │                                       │ │
+│  │  │          │           ┌────────────▼──────────────┐                        │ │
+│  │  │          │           │ DeepCopyPacketQueue (音频) │                        │ │
+│  │  │          │           │ av_packet_clone 深拷贝     │                        │ │
+│  │  │          │           └────────────┬──────────────┘                        │ │
+│  │  └──────────│────────────────────────│───────────────────────────────────────┘ │
+│  │             │                        │                                          │
+│  │  ┌──────────▼────────────────────────▼───────────────────────────────────────┐ │
+│  │  │                           ⑥ Muxer (封装)                                   │ │
+│  │  │                                                                           │ │
+│  │  │   ┌──────────────────────────────────────────────────────────┐            │ │
+│  │  │   │  min-heap (priority_queue + PacketComparator)            │            │ │
+│  │  │   │                                                        │            │ │
+│  │  │   │  视频 PTS: output_frame_count  (编码器顺序递增)          │            │ │
+│  │  │   │  音频 PTS: accumulated_samples / sample_rate (独立计算)  │            │ │
+│  │  │   │                                                        │            │ │
+│  │  │   │  ┌──┐ ┌──┐ ┌──┐ ┌──┐    按 PTS 弹出交错写入            │            │ │
+│  │  │   │  │A │ │V │ │A │ │V │ → av_interleaved_write_frame()    │            │ │
+│  │  │   │  └──┘ └──┘ └──┘ └──┘                                    │            │ │
+│  │  │   └──────────────────────────────────────────────────────────┘            │ │
+│  │  │                                    │                                       │ │
+│  │  └────────────────────────────────────│───────────────────────────────────────┘ │
+│  │                                       ▼                                          │
+│  │                          ../output/<filename>/output.mp4                         │
+│  └───────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              线程终止协议 (链式传播 EOF)                                │
+│                                                                                     │
+│  ①Demux                                        ⑥Mux                                  │
+│     │ 发送 flush pkt                               ▲                                 │
+│     │ (data=nullptr)                               │ 检查: 两路 done && 队列空        │
+│     ▼                                              │ ↓                               │
+│  ②/③Decoder                                        │ av_write_trailer()              │
+│     │ 收到 flush → send_packet(nullptr)            │ ↓                               │
+│     │ 收集编码器残留帧                               │ 关闭输出文件 → return            │
+│     │ RingBuffer::flush() ─────────────────────────▶│                                 │
+│     ▼                                              │                                 │
+│  ④/⑤Encoder                                        │                                 │
+│     │ 检测 ring buffer 空 + flush 信号              │                                 │
+│     │ send_frame(nullptr) 冲刷编码器                 │                                 │
+│     │ DeepCopyPacketQueue::mark_done() ────────────▶│                                 │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              RAII 资源管理与错误传播                                    │
+│                                                                                     │
+│  ┌────────────────────┐  ┌──────────────────┐  ┌─────────────────────┐              │
+│  │ InputFormatContext  │  │ CodecContextPtr  │  │ FramePtr            │              │
+│  │ Ptr                 │  │ → avcodec_free_  │  │ → av_frame_free     │              │
+│  │ → avformat_close_   │  │   context        │  │                     │              │
+│  │   input             │  └──────────────────┘  └─────────────────────┘              │
+│  └────────────────────┘                                                             │
+│  ┌────────────────────┐  ┌──────────────────────┐  错误路径只需 return;               │
+│  │ PacketPtr           │  │ CodecParametersPtr   │  RAII 自动释放所有资源              │
+│  │ → av_packet_free    │  │ → avcodec_parameters_│                                     │
+│  └────────────────────┘  │   free               │  pipeline.report_error(msg)         │
+│                          └──────────────────────┘  → atomic 广播 → join 后统一检查     │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### RAII 资源封装
@@ -216,7 +328,176 @@ A high-performance batch video transcoding tool built on the FFmpeg C API. It fe
 
 ### Architecture
 
-See the Chinese section above for the ASCII architecture diagram.
+```
+╔═══════════════════════════════════════════════════════════════════════════════════════╗
+║                      FFmpegProject Architecture (Two-Tier Thread Model)                 ║
+╚═══════════════════════════════════════════════════════════════════════════════════════╝
+
+┌──────────────────────────────────────────────────┐     ┌──────────────────────────┐
+│                   main.cpp                       │     │   ProcessingConfig        │
+│                                                  │     │   ┌─────────────────┐    │
+│  1. Parse CLI arguments                          │     │   │ rotate: 90|180|270│   │
+│     -rotate / -speed / -threads                  │◀────│   │ speed:  0.5~4    │    │
+│                                                  │     │   └─────────────────┘    │
+│  2. Scan ../input/*.mp4 -> build file list       │     └──────────────────────────┘
+│                                                  │
+│  3. Create ThreadPool(pool_size)                 │
+│     │                                            │
+│     │  for each file: pool.submit(task)          │
+│     │                                            │
+│     │  pool.wait_all() -> print result summary   │
+│     └────────────────┬───────────────────────────┘
+│                      │
+│                      │ submit N transcode tasks
+│                      ▼
+│  ┌───────────────────────────────────────────────────────────────────────────────┐
+│  │                       ThreadPool (Upper — Task-Level Concurrency)               │
+│  │                                                                               │
+│  │  std::vector<thread> workers_        ┌──────────┐                              │
+│  │  std::queue<function> tasks_         │ Worker 1 │──▶ transcode_single(A.mp4)  │
+│  │  mutex + condition_variable          ├──────────┤                              │
+│  │  atomic<size_t> active_count_        │ Worker 2 │──▶ transcode_single(B.mp4)  │
+│  │  atomic<size_t> total_submitted_     ├──────────┤                              │
+│  │  atomic<size_t> total_completed_     │ Worker 3 │──▶ transcode_single(C.mp4)  │
+│  │                                       └──────────┘                              │
+│  │  Worker loop: wait task -> execute -> notify done_cv_                           │
+│  └───────────────────────────────────────────────────────────────────────────────┘
+│                      │
+│                      │ Each Worker internally launches an independent 6-thread pipeline
+│                      ▼
+│  ┌───────────────────────────────────────────────────────────────────────────────┐
+│  │            transcode_single() (Lower — 6-Thread Transcode Pipeline)             │
+│  │                                                                               │
+│  │  ◆ Each call creates an independent Pipeline instance (all queues + errors)    │
+│  │  ◆ All FFmpeg resources managed by RAII, exception-safe                        │
+│  │                                                                               │
+│  │  ┌─────────────────────────────────────────────────────────────────────────┐  │
+│  │  │                   Pipeline (Queue Container + Error Broadcast)            │  │
+│  │  │                                                                         │  │
+│  │  │  ┌──────────────────┐  ┌──────────────────┐  ┌─────────────────────┐   │  │
+│  │  │  │ video_pkt_queue  │  │ audio_pkt_queue  │  │ error_flag_ (atomic)│   │  │
+│  │  │  │ PacketQueue      │  │ PacketQueue      │  │ error_msg_ (mutex)  │   │  │
+│  │  │  └────────┬─────────┘  └────────┬─────────┘  └─────────────────────┘   │  │
+│  │  │           │                     │                                       │  │
+│  │  │  ┌────────▼─────────────────────▼──────────┐                            │  │
+│  │  │  │ video_frame_ringbuf │ audio_frame_ringbuf│  RingBuffer<AVFrame*>(30) │  │
+│  │  │  └────────┬────────────────────┬───────────┘                            │  │
+│  │  │           │                    │                                        │  │
+│  │  │  ┌────────▼────────────────────▼───────────┐                            │  │
+│  │  │  │ en_video_pkt_queue │ en_audio_pkt_queue │  DeepCopyPacketQueue      │  │
+│  │  │  └─────────────────────────────────────────┘                            │  │
+│  │  └─────────────────────────────────────────────────────────────────────────┘  │
+│  │                                                                               │
+│  │                        ┌─ 6-Thread Data Flow ─┐                                │
+│  │                                                                               │
+│  │  ┌──────────┐  Video PacketQueue    ┌──────────────┐                             │
+│  │  │ 1. Demux │──────────────────────▶│ 2. Video Dec │──┐                          │
+│  │  │          │                      │              │  │ Video RingBuffer(30)     │
+│  │  │ av_read  │  Audio PacketQueue   └──────────────┘  │                          │
+│  │  │ _frame() │──┐                                      │                          │
+│  │  └──────────┘  │                ┌──────────────┐      │                          │
+│  │                └───────────────▶│ 3. Audio Dec │──┐   │                          │
+│  │                                 │              │  │   │ Audio RingBuffer(30)     │
+│  │                                 └──────────────┘  │   │                          │
+│  │                                                    │   │                          │
+│  │  ┌─────────────────────────────────────────────────▼───▼──────────────────────┐ │
+│  │  │                  4. Video Encoder (In-Encoder Processing)                    │ │
+│  │  │                                                                           │ │
+│  │  │   RingBuffer.pop()                                                        │ │
+│  │  │        │                                                                  │ │
+│  │  │        ▼                                                                  │ │
+│  │  │   ┌──────────────┐                                                        │ │
+│  │  │   │ VideoRotate  │  YUV420P pixel rotation (90/180/270)                   │ │
+│  │  │   │ Processor    │  90/270 swaps encoder width/height                     │ │
+│  │  │   └──────┬───────┘                                                        │ │
+│  │  │          ▼                                                                │ │
+│  │  │   ┌──────────────┐                                                        │ │
+│  │  │   │ Speed Change │  >1x: frame drop    <1x: frame dup                     │ │
+│  │  │   │ (drop/dup)   │  Consecutive PTS, no muxer-level adjustment needed     │ │
+│  │  │   └──────┬───────┘                                                        │ │
+│  │  │          ▼                                                                │ │
+│  │  │   avcodec_send_frame() ──▶ avcodec_receive_packet()                       │ │
+│  │  │          │                        │                                       │ │
+│  │  │          │           ┌────────────▼──────────────┐                        │ │
+│  │  │          │           │ DeepCopyPacketQueue (video)│                        │ │
+│  │  │          │           │ av_packet_clone deep copy  │                        │ │
+│  │  │          │           └────────────┬──────────────┘                        │ │
+│  │  └──────────│────────────────────────│───────────────────────────────────────┘ │
+│  │             │                        │                                          │
+│  │  ┌──────────▼────────────────────────▼───────────────────────────────────────┐ │
+│  │  │                  5. Audio Encoder (In-Encoder Processing)                   │ │
+│  │  │                                                                           │ │
+│  │  │   RingBuffer.pop()                                                        │ │
+│  │  │        │                                                                  │ │
+│  │  │        ▼                                                                  │ │
+│  │  │   ┌──────────────┐                                                        │ │
+│  │  │   │ Speed Change │  >1x: frame drop    <1x: frame dup                     │ │
+│  │  │   │ (drop/dup)   │  AC3 fixed 1536 samples/frame                          │ │
+│  │  │   └──────┬───────┘                                                        │ │
+│  │  │          ▼                                                                │ │
+│  │  │   avcodec_send_frame() ──▶ avcodec_receive_packet()                       │ │
+│  │  │          │                        │                                       │ │
+│  │  │          │           ┌────────────▼──────────────┐                        │ │
+│  │  │          │           │ DeepCopyPacketQueue (audio)│                        │ │
+│  │  │          │           │ av_packet_clone deep copy  │                        │ │
+│  │  │          │           └────────────┬──────────────┘                        │ │
+│  │  └──────────│────────────────────────│───────────────────────────────────────┘ │
+│  │             │                        │                                          │
+│  │  ┌──────────▼────────────────────────▼───────────────────────────────────────┐ │
+│  │  │                           6. Muxer                                         │ │
+│  │  │                                                                           │ │
+│  │  │   ┌──────────────────────────────────────────────────────────┐            │ │
+│  │  │   │  min-heap (priority_queue + PacketComparator)            │            │ │
+│  │  │   │                                                        │            │ │
+│  │  │   │  Video PTS: output_frame_count  (encoder sequential)    │            │ │
+│  │  │   │  Audio PTS: accumulated_samples / sample_rate            │            │ │
+│  │  │   │                                                        │            │ │
+│  │  │   │  ┌──┐ ┌──┐ ┌──┐ ┌──┐    pop by PTS, interleaved write  │            │ │
+│  │  │   │  │A │ │V │ │A │ │V │ -> av_interleaved_write_frame()   │            │ │
+│  │  │   │  └──┘ └──┘ └──┘ └──┘                                    │            │ │
+│  │  │   └──────────────────────────────────────────────────────────┘            │ │
+│  │  │                                    │                                       │ │
+│  │  └────────────────────────────────────│───────────────────────────────────────┘ │
+│  │                                       ▼                                          │
+│  │                          ../output/<filename>/output.mp4                         │
+│  └───────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                       Thread Termination Protocol (Chain-Propagated EOF)              │
+│                                                                                     │
+│  1.Demux                                        6.Mux                                  │
+│     │ send flush pkt                                ▲                                 │
+│     │ (data=nullptr)                                │ check: both done && queue empty │
+│     ▼                                              │ ↓                               │
+│  2/3.Decoder                                        │ av_write_trailer()              │
+│     │ receive flush -> send_packet(nullptr)         │ ↓                               │
+│     │ collect residual frames                       │ close output file -> return      │
+│     │ RingBuffer::flush() ─────────────────────────▶│                                 │
+│     ▼                                              │                                 │
+│  4/5.Encoder                                        │                                 │
+│     │ detect empty ring buffer + flush signal       │                                 │
+│     │ send_frame(nullptr) drain encoder             │                                 │
+│     │ DeepCopyPacketQueue::mark_done() ────────────▶│                                 │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              RAII Resource Management & Error Propagation              │
+│                                                                                     │
+│  ┌────────────────────┐  ┌──────────────────┐  ┌─────────────────────┐              │
+│  │ InputFormatContext  │  │ CodecContextPtr  │  │ FramePtr            │              │
+│  │ Ptr                 │  │ -> avcodec_free_  │  │ -> av_frame_free     │              │
+│  │ -> avformat_close_  │  │   context        │  │                     │              │
+│  │   input             │  └──────────────────┘  └─────────────────────┘              │
+│  └────────────────────┘                                                             │
+│  ┌────────────────────┐  ┌──────────────────────┐  Error paths: just return;         │
+│  │ PacketPtr           │  │ CodecParametersPtr   │  RAII auto-releases all resources  │
+│  │ -> av_packet_free   │  │ -> avcodec_parameters_│                                     │
+│  └────────────────────┘  │   free               │  pipeline.report_error(msg)         │
+│                          └──────────────────────┘  -> atomic broadcast -> check after  │
+│                                                                  join                │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
 
 ### RAII Resource Wrappers
 
