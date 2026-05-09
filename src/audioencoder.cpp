@@ -129,7 +129,9 @@ void audio_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
 
     int input_frame_count = 0;
     int output_frame_count = 0;
+    int output_packet_count = 0;
     int64_t sample_counter = 0;
+    int64_t input_sample_total = 0;
 
     while (true) {
         AVFrame* raw_frame = input_frame.get();
@@ -148,18 +150,7 @@ void audio_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
             continue;
         }
 
-        // ========== 倍速处理: 快放跳帧 ==========
-        if (speed > 1.0) {
-            int input_idx = input_frame_count - 1;
-            double expected_output = input_idx / speed;
-            int should_encode = static_cast<int>(expected_output);
-            if (should_encode < output_frame_count) {
-                av_frame_unref(input_frame.get());
-                continue;
-            }
-        }
-
-        // ========== 音频重采样: 解码格式 → FLTP ==========
+        // ========== 音频重采样: 解码格式 → FLTP (必须在倍速之前, 获取准确采样数) ==========
         AVFrame* source_frame = input_frame.get();
         bool src_is_fltp = (input_frame->format == AV_SAMPLE_FMT_FLTP);
         bool src_matches_layout = (input_frame->channel_layout == enc_ctx->channel_layout
@@ -225,6 +216,26 @@ void audio_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
             source_frame = resampled_frame.get();
         }
 
+        // ========== 倍速处理: 基于采样数 (非帧数) 的丢弃/复制 ==========
+        input_sample_total += source_frame->nb_samples;
+
+        if (speed > 1.0) {
+            // 快放: 计算应该编码的包数, 超出目标则丢弃
+            int64_t target_output_samples = static_cast<int64_t>(input_sample_total / speed);
+            int target_packets = static_cast<int>(target_output_samples / required_nb_samples);
+            if (output_packet_count >= target_packets) {
+                av_frame_unref(input_frame.get());
+                continue;
+            }
+        }
+
+        // 慢放: 提前计算目标包数 (sample_counter 会递增)
+        int slow_dup_target = 0;
+        if (speed < 1.0) {
+            int64_t target_output_samples = static_cast<int64_t>(input_sample_total / speed);
+            slow_dup_target = static_cast<int>(target_output_samples / required_nb_samples);
+        }
+
         int src_nb = source_frame->nb_samples;
         int dst_nb = required_nb_samples;
         int copy_nb = (src_nb < dst_nb) ? src_nb : dst_nb;
@@ -255,6 +266,7 @@ void audio_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
         }
 
         output_frame_count++;
+        output_packet_count++;
 
         while (true) {
             ret = avcodec_receive_packet(enc_ctx.get(), pkt.get());
@@ -277,13 +289,9 @@ void audio_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
             av_packet_unref(pkt.get());
         }
 
-        // ========== 慢放: 复制音频帧 ==========
+        // ========== 慢放: 基于采样数复制音频帧 ==========
         if (speed < 1.0) {
-            double repeats = 1.0 / speed;
-            int repeat_count = static_cast<int>(std::round(repeats));
-            if (repeat_count < 1) repeat_count = 1;
-
-            for (int r = 1; r < repeat_count; r++) {
+            while (output_packet_count < slow_dup_target) {
                 encode_frame->pts = sample_counter;
                 sample_counter += copy_nb;
 
@@ -291,6 +299,7 @@ void audio_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
                 if (ret < 0) continue;
 
                 output_frame_count++;
+                output_packet_count++;
 
                 while (true) {
                     ret = avcodec_receive_packet(enc_ctx.get(), pkt.get());
@@ -326,7 +335,6 @@ void audio_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
             break;
         }
 
-        av_packet_rescale_ts(pkt.get(), enc_ctx->time_base, output_time_base);
         pkt->stream_index = 1;
         out_q.push(*pkt);
         av_packet_unref(pkt.get());

@@ -111,6 +111,7 @@ TranscodeResult transcode_single(const std::string& input_path,
     audio_enc_params->bit_rate = 128000;
     audio_enc_params->codec_id = (config.audio_codec == AUDIO_CODEC_AAC)
         ? AV_CODEC_ID_AAC : AV_CODEC_ID_AC3;
+    audio_enc_params->frame_size = (config.audio_codec == AUDIO_CODEC_AAC) ? 1024 : 1536;
 
     // 输出时间基
     AVRational input_frame_rate = fmt_ctx->streams[video_stream_idx]->r_frame_rate;
