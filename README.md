@@ -21,6 +21,9 @@
 | **编码器内处理链** | 旋转 & 倍速处理嵌入编码线程：`pop frame → 旋转 → 倍速 drop/dup → encode`，零额外内存分配 |
 | **min-heap A/V 交错** | 封装器使用 `std::priority_queue` 按 PTS 排序输出，音频 PTS 从累计采样数独立计算，不依赖编码器 PTS |
 | **优雅关闭协议** | 链式传播 EOF：Demux flush pkt → Decoder drain → RingBuffer::flush() → Encoder drain → mark_done() → Muxer write trailer |
+| **音频重采样 (libswresample)** | 自动检测解码器输出格式，`SwrContext` 转换为 AC3 编码器所需的 FLTP，支持任意输入音频格式 |
+| **视频像素格式转换 (libswscale)** | 自动检测解码器输出像素格式，`SwsContext` 转换为 MPEG4 编码器所需的 YUV420P，支持任意输入像素格式 |
+| **结构化日志系统** | 线程安全 Logger，带时间戳 + 日志级别 + 线程标签，支持控制台 + 文件双输出 |
 
 ### 项目架构
 
@@ -256,10 +259,12 @@ FFmpegProject/
 │   ├── videodecoder.h / audiodecoder.h   # 视频 / 音频解码
 │   ├── videoencoder.h / audioencoder.h   # 视频 / 音频编码
 │   ├── video_rotate.h              # YUV420P 像素旋转
+│   ├── logger.h                    # 结构化日志系统
 │   ├── packet_queue.h              # 无界线程安全队列
 │   ├── ring_buffer.h               # 定长环形缓冲
 │   └── deep_copy_packey_queue.h    # 深拷贝队列 + EOF 信号
 ├── src/                            # 各模块实现
+│   ├── logger.cpp                  # 日志系统实现
 ├── input/                          # 输入文件目录 (扫描 *.mp4)
 ├── output/<filename>/              # 输出目录 (每个文件独立子目录)
 ├── ffmpeg-4.4-full_build-shared/   # FFmpeg 4.4 共享库
@@ -302,7 +307,7 @@ FFmpegProject [-rotate <angle>] [-speed <ratio>] [-threads <n>]
 ### 技术栈
 
 - **语言:** C++17 (std::thread, std::atomic, std::filesystem, std::priority_queue)
-- **媒体:** FFmpeg 4.4 C API (libavformat, libavcodec, libavutil)
+- **媒体:** FFmpeg 4.4 C API (libavformat, libavcodec, libavutil, libswresample, libswscale)
 - **构建:** CMake 3.27 + MinGW
 - **平台:** Windows (可移植至 Linux)
 
@@ -325,6 +330,9 @@ A high-performance batch video transcoding tool built on the FFmpeg C API. It fe
 | **In-Encoder Processing Chain** | Rotation & speed change embedded in encoder thread: `pop frame → rotate → speed drop/dup → encode`, zero extra allocation |
 | **Min-Heap A/V Interleaving** | Muxer uses `std::priority_queue` for PTS-ordered output. Audio PTS independently recalculated from accumulated sample count |
 | **Graceful Shutdown Protocol** | Chain-propagated EOF: Demux flush pkt → Decoder drain → `RingBuffer::flush()` → Encoder drain → `mark_done()` → Muxer write trailer |
+| **Audio Resampling (libswresample)** | Auto-detect decoder output format, `SwrContext` converts to FLTP required by AC3 encoder, supports any input audio format |
+| **Video Pixel Conversion (libswscale)** | Auto-detect decoder output pixel format, `SwsContext` converts to YUV420P required by MPEG4 encoder, supports any input pixel format |
+| **Structured Logging** | Thread-safe Logger with timestamp + log level + thread tag, dual output to console + file |
 
 ### Architecture
 
@@ -560,10 +568,12 @@ FFmpegProject/
 │   ├── videodecoder.h / audiodecoder.h   # Video / Audio decode
 │   ├── videoencoder.h / audioencoder.h   # Video / Audio encode
 │   ├── video_rotate.h              # YUV420P pixel rotation
+│   ├── logger.h                    # Structured logging system
 │   ├── packet_queue.h              # Unbounded thread-safe queue
 │   ├── ring_buffer.h               # Fixed-size ring buffer
 │   └── deep_copy_packey_queue.h    # Deep copy queue + EOF signal
 ├── src/                            # Module implementations
+│   ├── logger.cpp                  # Logger implementation
 ├── input/                          # Input files directory (scans *.mp4)
 ├── output/<filename>/              # Output directory (per-file subdir)
 ├── ffmpeg-4.4-full_build-shared/   # FFmpeg 4.4 shared libraries
@@ -604,6 +614,34 @@ Examples:
 ### Tech Stack
 
 - **Language:** C++17 (std::thread, std::atomic, std::filesystem, std::priority_queue)
-- **Media:** FFmpeg 4.4 C API (libavformat, libavcodec, libavutil)
+- **Media:** FFmpeg 4.4 C API (libavformat, libavcodec, libavutil, libswresample, libswscale)
 - **Build:** CMake 3.27 + MinGW
 - **Platform:** Windows (portable to Linux)
+
+---
+
+## 更新日志 / Changelog
+
+### 2026-05-09 — v0.3.0 (P0 基础能力补齐)
+
+| 模块 | 内容 |
+|------|------|
+| **音频重采样** | `src/audioencoder.cpp` — 插入 `SwrContext`（RAII 封装），自动将解码器输出的任意采样格式/采样率/声道布局转换为 AC3 编码器所需的 FLTP，支持 FLT / S16 / S16P / S32 等常见格式 |
+| **视频像素格式转换** | `src/videoencoder.cpp` — 插入 `SwsContext`（RAII 封装），自动将解码器输出的任意像素格式（NV12 / YUVJ420P / YUV422P 等）转换为 MPEG4 编码器所需的 YUV420P |
+| **结构化日志系统** | `include/logger.h` + `src/logger.cpp` — 线程安全 Logger 类，`[HH:MM:SS.mmm] [LEVEL] [TAG] msg` 格式，支持 `DEBUG/INFO/WARN/ERROR` 四级，控制台 + 文件双输出。所有模块的 `std::cout`/`std::cerr` 已全部替换 |
+
+### 2026-05-08 — v0.2.0 (批处理 + 线程池)
+
+| 模块 | 内容 |
+|------|------|
+| **自定义线程池** | `include/thread_pool.h` + `src/thread_pool.cpp` — 手写固定大小线程池，`std::queue` + mutex + CV + atomic 计数器，两层级并发（池内 Worker 执行 transcode_single，每个任务内部 6 线程管道） |
+| **批量自动处理** | 自动扫描 `../input/*.mp4`，输出到 `../output/<文件名>/output.mp4`，支持 `-threads <n>` 控制并发数 |
+
+### 2026-05-07 — v0.1.0 (初始架构)
+
+| 模块 | 内容 |
+|------|------|
+| **6 线程 Pipeline** | Demux → Video/Audio Dec → Video/Audio Enc (旋转+倍速处理) → Mux |
+| **Pipeline + RAII** | 消除全局变量，5 种 `std::unique_ptr` 封装 FFmpeg 资源，统一错误传播 |
+| **旋转 + 倍速** | `-rotate 90|180|270` YUV420P 像素旋转，`-speed 0.5~4` 帧丢弃/复制倍速 |
+| **A/V 同步** | Muxer min-heap PTS 交错 + 音频累计采样独立计算 |

@@ -4,7 +4,7 @@
 #include "audiodecoder.h"
 #include "pipeline.h"
 #include "ffmpeg_raii.h"
-#include <iostream>
+#include "logger.h"
 #include <fstream>
 
 extern "C" {
@@ -108,7 +108,7 @@ void audio_decode_thread(AVCodecParameters* codec_par,
         }
 
         if (avcodec_send_packet(codec_ctx.get(), &pkt) < 0) {
-            std::cerr << "[Warn] 音频Packet发送失败\n";
+            Logger::warn("AudioDecoder", "音频Packet发送失败");
             av_packet_unref(&pkt);
             continue;
         }
@@ -116,11 +116,10 @@ void audio_decode_thread(AVCodecParameters* codec_par,
         while (avcodec_receive_frame(codec_ctx.get(), frame.get()) >= 0) {
             frame_count++;
             if (frame_count % 100 == 0) {
-                std::cout << "[Audio Decode Info] 解码PCM帧: pts=" << frame->pts
-                          << " channels=" << frame->channels
-                          << " samples=" << frame->nb_samples
-                          << " format=" << av_get_sample_fmt_name(static_cast<AVSampleFormat>(frame->format))
-                          << " → 推入环形缓冲区\n";
+                Logger::debug("AudioDecoder", std::string("解码PCM帧: pts=")
+                              + std::to_string(frame->pts) + " channels=" + std::to_string(frame->channels)
+                              + " samples=" + std::to_string(frame->nb_samples)
+                              + " format=" + av_get_sample_fmt_name(static_cast<AVSampleFormat>(frame->format)));
             }
 
 #if ENABLE_PCM_OUTPUT
@@ -138,6 +137,6 @@ void audio_decode_thread(AVCodecParameters* codec_par,
     }
 
     out_rb.flush();
-    std::cout << "[AudioDecoder Info] 音频解码线程退出，共处理 " << frame_count << " 帧\n";
+    Logger::info("AudioDecoder", std::string("音频解码线程退出，共处理 ") + std::to_string(frame_count) + " 帧");
     // RAII: codec_ctx, frame 自动释放
 }

@@ -4,7 +4,7 @@
 #include "mux.h"
 #include "pipeline.h"
 #include "ffmpeg_raii.h"
-#include <iostream>
+#include "logger.h"
 #include <queue>
 #include <functional>
 #include <memory>
@@ -36,7 +36,7 @@ void mux_thread(const std::string& output_file,
                 DeepCopyPacketQueue& audio_q,
                 const ProcessingConfig& config,
                 Pipeline* pipeline) {
-    std::cout << "[Mux] 开始创建输出文件: " << output_file << "\n";
+    Logger::info("Mux", std::string("开始创建输出文件: ") + output_file);
 
     AVFormatContext* out_fmt_ctx_raw = nullptr;
     char err_buf[1024];
@@ -76,11 +76,11 @@ void mux_thread(const std::string& output_file,
     }
     video_stream->time_base = output_time_base;
 
-    std::cout << "[Mux Info] 视频流配置: 分辨率="
-              << video_stream->codecpar->width << "x" << video_stream->codecpar->height
-              << ", 编码器ID=" << video_stream->codecpar->codec_id
-              << ", codec_tag=0x" << std::hex << video_stream->codecpar->codec_tag << std::dec
-              << ", 时间基=" << video_stream->time_base.num << "/" << video_stream->time_base.den << "\n";
+    Logger::info("Mux", std::string("视频流配置: 分辨率=")
+                 + std::to_string(video_stream->codecpar->width) + "x"
+                 + std::to_string(video_stream->codecpar->height)
+                 + ", 时间基=" + std::to_string(video_stream->time_base.num)
+                 + "/" + std::to_string(video_stream->time_base.den));
 
     AVStream* audio_stream = nullptr;
     if (audio_enc_par && audio_enc_par->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -89,18 +89,17 @@ void mux_thread(const std::string& output_file,
             ret = avcodec_parameters_copy(audio_stream->codecpar, audio_enc_par);
             if (ret < 0) {
                 av_strerror(ret, err_buf, sizeof(err_buf));
-                std::cerr << "[Mux Warn] 复制音频编码参数失败: " << err_buf << "\n";
+                Logger::warn("Mux", std::string("复制音频编码参数失败: ") + err_buf);
                 audio_stream = nullptr;
             } else {
                 audio_stream->time_base = (AVRational){1, audio_enc_par->sample_rate};
-                std::cout << "[Mux Info] 音频流配置: 采样率=" << audio_stream->codecpar->sample_rate
-                          << ", 声道数=" << audio_stream->codecpar->channels
-                          << ", 编码器ID=" << audio_stream->codecpar->codec_id
-                          << ", 时间基=" << audio_stream->time_base.num << "/" << audio_stream->time_base.den << "\n";
+                Logger::info("Mux", std::string("音频流配置: 采样率=")
+                             + std::to_string(audio_stream->codecpar->sample_rate)
+                             + ", 声道数=" + std::to_string(audio_stream->codecpar->channels));
             }
         }
     } else {
-        std::cout << "[Mux Info] 无音频流参数，仅处理视频\n";
+        Logger::info("Mux", "无音频流参数，仅处理视频");
     }
 
     av_dump_format(out_fmt_ctx_raw, 0, output_file.c_str(), 1);
@@ -123,7 +122,7 @@ void mux_thread(const std::string& output_file,
         return;
     }
 
-    std::cout << "[Mux] 开始写入数据包...\n";
+    Logger::info("Mux", "开始写入数据包...");
 
     std::priority_queue<AVPacket*, std::vector<AVPacket*>, PacketComparator> packet_queue;
 
@@ -142,7 +141,8 @@ void mux_thread(const std::string& output_file,
                     video_pkt->stream_index = video_stream->index;
 
                     if (video_pkt->pts < 0) {
-                        std::cerr << "[Mux Warn] 无效的视频包PTS: " << video_pkt->pts << "，跳过此包\n";
+                        Logger::warn("Mux", std::string("无效的视频包PTS: ")
+                                     + std::to_string(video_pkt->pts) + "，跳过此包");
                         continue;
                     }
 
@@ -151,8 +151,8 @@ void mux_thread(const std::string& output_file,
                     video_packet_count++;
 
                     if (video_packet_count % 100 == 0) {
-                        std::cout << "[Mux Debug] 视频包: pts=" << (packet_queue.empty() ? -1 : packet_queue.top()->pts)
-                                  << "\n";
+                        Logger::debug("Mux", std::string("视频包: pts=")
+                                      + std::to_string(packet_queue.empty() ? -1 : packet_queue.top()->pts));
                     }
                 } else {
                     video_done = true;
@@ -181,8 +181,9 @@ void mux_thread(const std::string& output_file,
                     audio_packet_count++;
 
                     if (audio_packet_count % 100 == 0) {
-                        std::cout << "[Mux Debug] 音频包: pts=" << (packet_queue.empty() ? -1 : packet_queue.top()->pts)
-                                  << ", 累计=" << audio_accumulated_samples << "\n";
+                        Logger::debug("Mux", std::string("音频包: pts=")
+                                      + std::to_string(packet_queue.empty() ? -1 : packet_queue.top()->pts)
+                                      + ", 累计=" + std::to_string(audio_accumulated_samples));
                     }
                 } else {
                     audio_done = true;
@@ -197,16 +198,17 @@ void mux_thread(const std::string& output_file,
             ret = av_interleaved_write_frame(out_fmt_ctx_raw, pkt);
             if (ret < 0) {
                 av_strerror(ret, err_buf, sizeof(err_buf));
-                std::cerr << "[Mux Error] 写入数据包失败: " << err_buf
-                          << " (stream=" << pkt->stream_index
-                          << ", pts=" << pkt->pts << ", size=" << pkt->size << ")\n";
+                Logger::error("Mux", std::string("写入数据包失败: ") + err_buf
+                              + " (stream=" + std::to_string(pkt->stream_index)
+                              + ", pts=" + std::to_string(pkt->pts)
+                              + ", size=" + std::to_string(pkt->size) + ")");
             }
 
             int total_packets = video_packet_count + audio_packet_count;
             if (total_packets % 1000 == 0) {
-                std::cout << "[Mux] 已处理 " << total_packets
-                          << " 个包（视频: " << video_packet_count
-                          << ", 音频: " << audio_packet_count << "）\n";
+                Logger::info("Mux", std::string("已处理 ") + std::to_string(total_packets)
+                             + " 个包（视频: " + std::to_string(video_packet_count)
+                             + ", 音频: " + std::to_string(audio_packet_count) + "）");
             }
 
             av_packet_free(&pkt);
@@ -217,17 +219,17 @@ void mux_thread(const std::string& output_file,
         }
     }
 
-    std::cout << "[Mux] 写入文件尾...\n";
+    Logger::info("Mux", "写入文件尾...");
     ret = av_write_trailer(out_fmt_ctx_raw);
     if (ret < 0) {
         av_strerror(ret, err_buf, sizeof(err_buf));
-        std::cerr << "[Mux Warn] 写入文件尾失败: " << err_buf << "\n";
+        Logger::warn("Mux", std::string("写入文件尾失败: ") + err_buf);
     }
 
-    std::cout << "[Mux] 完成！文件: " << output_file
-              << "，视频包: " << video_packet_count
-              << "，音频包: " << audio_packet_count
-              << "，音频累计: " << audio_accumulated_samples << "\n";
+    Logger::info("Mux", std::string("完成！文件: ") + output_file
+                 + "，视频包: " + std::to_string(video_packet_count)
+                 + "，音频包: " + std::to_string(audio_packet_count)
+                 + "，音频累计: " + std::to_string(audio_accumulated_samples));
 
     cleanup_output(out_fmt_ctx_raw);
 }

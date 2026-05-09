@@ -20,6 +20,7 @@ add_executable(FFmpegProject
         ${SRC_ROOT}/audioencoder.cpp
         ${SRC_ROOT}/mux.cpp
         ${SRC_ROOT}/video_rotate.cpp
+        ${SRC_ROOT}/logger.cpp
 
 )
 

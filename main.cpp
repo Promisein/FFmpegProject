@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <sstream>
 #include <filesystem>
 #include "demux.h"
 #include "videodecoder.h"
@@ -15,6 +16,7 @@
 #include "ffmpeg_raii.h"
 #include "config.h"
 #include "thread_pool.h"
+#include "logger.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -42,7 +44,7 @@ TranscodeResult transcode_single(const std::string& input_path,
 
     std::string output_file = output_dir + "/output.mp4";
 
-    std::cout << "\n[Task] 开始转码: " << input_path << " -> " << output_file << "\n";
+    Logger::info("main", std::string("开始转码: ") + input_path + " -> " + output_file);
 
     // 打开输入文件
     AVFormatContext* fmt_ctx_raw = nullptr;
@@ -158,19 +160,21 @@ TranscodeResult transcode_single(const std::string& input_path,
     }
 
     result.success = true;
-    std::cout << "[Task] 完成: " << input_path << "\n";
+    Logger::info("main", std::string("完成: ") + input_path);
     return result;
 }
 
 // ====================== 打印用法 ======================
 void print_usage(const char* prog) {
-    std::cout << "用法: " << prog << " [-rotate <angle>] [-speed <ratio>] [-threads <n>]\n"
-              << "  -rotate <angle>  视频旋转: 90, 180, 270\n"
-              << "  -speed  <ratio>  播放速度: 0.5, 0.75, 1.25, 1.5, 2, 4\n"
-              << "  -threads <n>     线程池并发数（默认 3）\n"
-              << "\n"
-              << "自动扫描 ../input/*.mp4，输出到 ../output/<文件名>/\n"
-              << "示例: " << prog << " -rotate 90 -speed 1.5 -threads 4\n";
+    std::ostringstream usage;
+    usage << "用法: " << prog << " [-rotate <angle>] [-speed <ratio>] [-threads <n>]\n"
+          << "  -rotate <angle>  视频旋转: 90, 180, 270\n"
+          << "  -speed  <ratio>  播放速度: 0.5, 0.75, 1.25, 1.5, 2, 4\n"
+          << "  -threads <n>     线程池并发数（默认 3）\n"
+          << "\n"
+          << "自动扫描 ../input/*.mp4，输出到 ../output/<文件名>/\n"
+          << "示例: " << prog << " -rotate 90 -speed 1.5 -threads 4";
+    Logger::info("usage", usage.str());
 }
 
 // ====================== 主函数 ======================
@@ -188,13 +192,13 @@ int main(int argc, char* argv[]) {
             else if (angle == 180) config.rotate = ROTATE_180;
             else if (angle == 270) config.rotate = ROTATE_270_CW;
             else {
-                std::cerr << "[Error] 不支持的旋转角度: " << angle << "\n";
+                Logger::error("main", std::string("不支持的旋转角度: ") + std::to_string(angle));
                 return 1;
             }
         } else if (std::strcmp(argv[i], "-speed") == 0 && i + 1 < argc) {
             config.speed_ratio = std::stod(argv[++i]);
             if (config.speed_ratio <= 0) {
-                std::cerr << "[Error] 倍速值必须 > 0\n";
+                Logger::error("main", "倍速值必须 > 0");
                 return 1;
             }
         } else if (std::strcmp(argv[i], "-threads") == 0 && i + 1 < argc) {
@@ -204,15 +208,15 @@ int main(int argc, char* argv[]) {
             print_usage(argv[0]);
             return 0;
         } else {
-            std::cerr << "[Error] 未知参数: " << argv[i] << "\n";
+            Logger::error("main", std::string("未知参数: ") + argv[i]);
             print_usage(argv[0]);
             return 1;
         }
     }
 
-    std::cout << "[Main] 配置: 旋转=" << config.rotate
-              << "度, 倍速=" << config.speed_ratio
-              << "x, 线程池=" << pool_size << "\n";
+    Logger::info("Main", std::string("配置: 旋转=") + std::to_string(config.rotate)
+                 + "度, 倍速=" + std::to_string(config.speed_ratio)
+                 + "x, 线程池=" + std::to_string(pool_size));
 
     avformat_network_init();
 
@@ -230,7 +234,7 @@ int main(int argc, char* argv[]) {
             }
         }
     } catch (const fs::filesystem_error& e) {
-        std::cerr << "[Error] 扫描输入目录失败: " << e.what() << "\n";
+        Logger::error("main", std::string("扫描输入目录失败: ") + e.what());
         return -1;
     }
 
@@ -238,11 +242,11 @@ int main(int argc, char* argv[]) {
     std::sort(input_files.begin(), input_files.end());
 
     if (input_files.empty()) {
-        std::cerr << "[Error] 在 " << input_dir << " 未找到 .mp4 文件\n";
+        Logger::error("main", "在 " + input_dir + " 未找到 .mp4 文件");
         return -1;
     }
 
-    std::cout << "[Main] 扫描到 " << input_files.size() << " 个视频文件\n";
+    Logger::info("Main", "扫描到 " + std::to_string(input_files.size()) + " 个视频文件");
 
     // 限制线程池大小不超过文件数
     if (pool_size > static_cast<int>(input_files.size())) {
@@ -268,7 +272,7 @@ int main(int argc, char* argv[]) {
         try {
             fs::create_directories(output_dir);
         } catch (const fs::filesystem_error& e) {
-            std::cerr << "[Error] 创建输出目录失败: " << output_dir << "\n";
+            Logger::error("main", "创建输出目录失败: " + output_dir + " - " + e.what());
             results[i].success = false;
             results[i].error = e.what();
             continue;
@@ -280,25 +284,25 @@ int main(int argc, char* argv[]) {
     }
 
     // 等待所有任务完成
-    std::cout << "[Main] 已提交 " << pool.total_submitted() << " 个任务，等待完成...\n";
+    Logger::info("Main", "已提交 " + std::to_string(pool.total_submitted()) + " 个任务，等待完成...");
     pool.wait_all();
-    std::cout << "[Main] 所有任务已完成\n\n";
+    Logger::info("Main", "所有任务已完成");
 
     // 打印结果汇总
     int success_count = 0, fail_count = 0;
-    std::cout << "========== 转码结果汇总 ==========\n";
+    Logger::info("Main", "========== 转码结果汇总 ==========");
     for (size_t i = 0; i < results.size(); i++) {
         const auto& r = results[i];
         if (r.success) {
-            std::cout << "  [OK]    " << r.filename << "\n";
+            Logger::info("Main", "  [OK]    " + r.filename);
             success_count++;
         } else {
-            std::cout << "  [FAIL]  " << r.filename << " - " << r.error << "\n";
+            Logger::error("Main", "  [FAIL]  " + r.filename + " - " + r.error);
             fail_count++;
         }
     }
-    std::cout << "成功: " << success_count << ", 失败: " << fail_count
-              << ", 总计: " << results.size() << "\n";
+    Logger::info("Main", "成功: " + std::to_string(success_count) + ", 失败: "
+                 + std::to_string(fail_count) + ", 总计: " + std::to_string(results.size()));
 
     avformat_network_deinit();
     return fail_count > 0 ? 1 : 0;

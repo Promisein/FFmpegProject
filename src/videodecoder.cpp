@@ -4,7 +4,7 @@
 #include "videodecoder.h"
 #include "pipeline.h"
 #include "ffmpeg_raii.h"
-#include <iostream>
+#include "logger.h"
 #include <fstream>
 
 extern "C" {
@@ -71,7 +71,7 @@ void video_decode_thread(AVCodecParameters* codec_par,
                          PacketQueue<AVPacket>& in_queue,
                          RingBuffer<AVFrame*>& out_rb,
                          Pipeline* pipeline) {
-    std::cout << "start videoDecode!\n";
+    Logger::info("VideoDecoder", "start videoDecode!");
 
 #if ENABLE_YUV_OUTPUT
     YUVFileWriter yuv_writer;
@@ -111,18 +111,17 @@ void video_decode_thread(AVCodecParameters* codec_par,
         }
 
         if (avcodec_send_packet(codec_ctx.get(), &pkt) < 0) {
-            std::cerr << "[Warn] 视频Packet发送失败\n";
+            Logger::warn("VideoDecoder", "视频Packet发送失败");
             av_packet_unref(&pkt);
             continue;
         }
 
         while (avcodec_receive_frame(codec_ctx.get(), frame.get()) >= 0) {
             frame_count++;
-            if (frame_count % 10 == 0) {
-                std::cout << "[Video] 解码YUV帧: pts=" << frame->pts
-                          << " width=" << frame->width
-                          << " height=" << frame->height
-                          << " → 推入环形缓冲区\n";
+            if (frame_count % 100 == 0) {
+                Logger::debug("VideoDecoder", std::string("解码YUV帧: pts=")
+                              + std::to_string(frame->pts) + " width=" + std::to_string(frame->width)
+                              + " height=" + std::to_string(frame->height));
             }
 
 #if ENABLE_YUV_OUTPUT
@@ -142,6 +141,6 @@ void video_decode_thread(AVCodecParameters* codec_par,
     }
 
     out_rb.flush();
-    std::cout << "[VideoDecoder Info] 视频解码线程退出，共处理 " << frame_count << " 帧\n";
+    Logger::info("VideoDecoder", std::string("视频解码线程退出，共处理 ") + std::to_string(frame_count) + " 帧");
     // RAII: codec_ctx, frame 自动释放
 }

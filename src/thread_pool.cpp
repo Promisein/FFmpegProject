@@ -2,13 +2,13 @@
 // ThreadPool implementation
 //
 #include "thread_pool.h"
-#include <iostream>
+#include "logger.h"
 
 ThreadPool::ThreadPool(size_t num_threads) {
     for (size_t i = 0; i < num_threads; i++) {
         workers_.emplace_back(&ThreadPool::worker_loop, this);
     }
-    std::cout << "[ThreadPool] 创建线程池，工作线程数: " << num_threads << "\n";
+    Logger::info("ThreadPool", std::string("创建线程池，工作线程数: ") + std::to_string(num_threads));
 }
 
 ThreadPool::~ThreadPool() {
@@ -20,7 +20,7 @@ ThreadPool::~ThreadPool() {
     for (auto& w : workers_) {
         if (w.joinable()) w.join();
     }
-    std::cout << "[ThreadPool] 线程池已销毁\n";
+    Logger::info("ThreadPool", "线程池已销毁");
 }
 
 void ThreadPool::submit(std::function<void()> task) {

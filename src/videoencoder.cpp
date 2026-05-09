@@ -5,7 +5,7 @@
 #include "pipeline.h"
 #include "ffmpeg_raii.h"
 #include "video_rotate.h"
-#include <iostream>
+#include "logger.h"
 #include <cmath>
 
 extern "C" {
@@ -14,7 +14,16 @@ extern "C" {
 #include <libavutil/avutil.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/error.h>
+#include <libswscale/swscale.h>
 }
+
+// SwsContext RAII 包装
+struct SwsContextDeleter {
+    void operator()(SwsContext* ctx) const {
+        if (ctx) sws_freeContext(ctx);
+    }
+};
+using SwsContextPtr = std::unique_ptr<SwsContext, SwsContextDeleter>;
 
 void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_time_base,
                          RingBuffer<AVFrame*>& in_rb, DeepCopyPacketQueue& out_q,
@@ -37,7 +46,7 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
     if (config.rotate != ROTATE_NONE) {
         rotator = VideoRotateProcessor(config.rotate);
         need_rotate = true;
-        std::cout << "[VideoEncoder Info] 旋转已启用: " << config.rotate << "度\n";
+        Logger::info("VideoEncoder", std::string("旋转已启用: ") + std::to_string(config.rotate) + "度");
     }
 
     // 确定编码器输出分辨率（90/270旋转时交换宽高）
@@ -46,11 +55,12 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
     if (config.rotate == ROTATE_90_CW || config.rotate == ROTATE_270_CW) {
         std::swap(enc_width, enc_height);
     }
-    std::cout << "[VideoEncoder Info] 编码输出分辨率: " << enc_width << "x" << enc_height << "\n";
+    Logger::info("VideoEncoder", std::string("编码输出分辨率: ")
+                 + std::to_string(enc_width) + "x" + std::to_string(enc_height));
 
     double speed = config.speed_ratio;
     if (speed != 1.0) {
-        std::cout << "[VideoEncoder Info] 倍速: " << speed << "x\n";
+        Logger::info("VideoEncoder", std::string("倍速: ") + std::to_string(speed) + "x");
     }
 
     CodecContextPtr enc_ctx(avcodec_alloc_context3(encoder));
@@ -78,7 +88,7 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
         return;
     }
 
-    std::cout << "[VideoEncoder Info] MPEG4编码器打开成功\n";
+    Logger::info("VideoEncoder", "MPEG4编码器打开成功");
 
     FramePtr local_frame(av_frame_alloc());
     PacketPtr pkt(av_packet_alloc());
@@ -87,21 +97,26 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
         return;
     }
 
-    int input_frame_count = 0;   // 从环形缓冲区读取的帧数
-    int output_frame_count = 0;  // 实际发送到编码器的帧数
+    // 像素格式转换上下文（懒初始化）
+    SwsContextPtr sws_ctx;
+    FramePtr converted_frame;
+
+    int input_frame_count = 0;
+    int output_frame_count = 0;
 
     while (true) {
         AVFrame* raw_frame = local_frame.get();
         bool success = in_rb.pop(raw_frame);
         if (!success) {
-            std::cout << "[VideoEncoder Info] 环形缓冲区已空，停止接收帧\n";
+            Logger::info("VideoEncoder", "环形缓冲区已空，停止接收帧");
             break;
         }
 
         input_frame_count++;
 
         if (!local_frame->data[0]) {
-            std::cerr << "[VideoEncoder Warn] 无效视频Frame（第" << input_frame_count << "帧），跳过\n";
+            Logger::warn("VideoEncoder", std::string("无效视频Frame（第")
+                         + std::to_string(input_frame_count) + "帧），跳过");
             av_frame_unref(local_frame.get());
             continue;
         }
@@ -114,21 +129,64 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
             if (rotated_frame) {
                 frame_to_encode = rotated_frame.get();
             } else {
-                std::cerr << "[VideoEncoder Warn] 旋转失败，使用原始帧\n";
+                Logger::warn("VideoEncoder", "旋转失败，使用原始帧");
             }
         }
 
-        // ========== 步骤2: 倍速处理 ==========
+        // ========== 步骤2: 像素格式转换 (任意格式 → YUV420P) ==========
+        bool need_convert = (frame_to_encode->format != AV_PIX_FMT_YUV420P);
+        FramePtr converted;
+        if (need_convert) {
+            if (!sws_ctx) {
+                sws_ctx.reset(sws_getContext(
+                    frame_to_encode->width, frame_to_encode->height,
+                    static_cast<AVPixelFormat>(frame_to_encode->format),
+                    enc_width, enc_height, AV_PIX_FMT_YUV420P,
+                    SWS_BILINEAR, nullptr, nullptr, nullptr));
+                if (!sws_ctx) {
+                    Logger::error("VideoEncoder", "创建SwsContext失败");
+                    av_frame_unref(local_frame.get());
+                    continue;
+                }
+                Logger::info("VideoEncoder",
+                    std::string("像素格式转换已启用: ")
+                    + av_get_pix_fmt_name(static_cast<AVPixelFormat>(frame_to_encode->format))
+                    + " → YUV420P");
+            }
+
+            converted.reset(av_frame_alloc());
+            if (!converted) {
+                Logger::warn("VideoEncoder", "分配转换帧失败");
+                av_frame_unref(local_frame.get());
+                continue;
+            }
+            converted->format = AV_PIX_FMT_YUV420P;
+            converted->width = enc_width;
+            converted->height = enc_height;
+            ret = av_frame_get_buffer(converted.get(), 0);
+            if (ret < 0) {
+                Logger::warn("VideoEncoder", "分配转换帧缓冲区失败");
+                av_frame_unref(local_frame.get());
+                continue;
+            }
+
+            sws_scale(sws_ctx.get(),
+                frame_to_encode->data, frame_to_encode->linesize,
+                0, frame_to_encode->height,
+                converted->data, converted->linesize);
+            // sws_scale returns the output slice height, no error code
+            // Copy PTS from source
+            converted->pts = frame_to_encode->pts;
+            frame_to_encode = converted.get();
+            converted_frame = std::move(converted);
+        }
+
+        // ========== 步骤3: 倍速处理 ==========
         if (speed > 1.0) {
-            // 快放：跳帧
-            // 2x: 每隔1帧取1帧 (encode frame 0,2,4,...)
-            // 1.5x: 每3帧取2帧 (encode frame 0,1,3,4,6,7,...)
-            // 4x: 每4帧取1帧 (encode frame 0,4,8,...)
-            int input_idx = input_frame_count - 1; // 0-based
+            int input_idx = input_frame_count - 1;
             double expected_output = input_idx / speed;
             int should_encode = static_cast<int>(expected_output);
             if (should_encode < output_frame_count) {
-                // 跳帧：不编码此帧
                 av_frame_unref(local_frame.get());
                 continue;
             }
@@ -141,7 +199,8 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
         ret = avcodec_send_frame(enc_ctx.get(), frame_to_encode);
         if (ret < 0) {
             av_strerror(ret, err_buf, sizeof(err_buf));
-            std::cerr << "[VideoEncoder Warn] 第" << output_frame_count << "帧编码发送失败：" << err_buf << "\n";
+            Logger::warn("VideoEncoder", std::string("第") + std::to_string(output_frame_count)
+                         + "帧编码发送失败：" + err_buf);
             av_frame_unref(local_frame.get());
             continue;
         }
@@ -154,16 +213,17 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
             if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
             if (ret < 0) {
                 av_strerror(ret, err_buf, sizeof(err_buf));
-                std::cerr << "[VideoEncoder Warn] 接收编码包失败：" << err_buf << "\n";
+                Logger::warn("VideoEncoder", std::string("接收编码包失败：") + err_buf);
                 break;
             }
 
             pkt->stream_index = 0;
             av_packet_rescale_ts(pkt.get(), enc_ctx->time_base, output_time_base);
 
-            if (output_frame_count % 10 == 0) {
-                std::cout << "[VideoEncoder Info] 编码MPEG4 Packet: pts=" << pkt->pts
-                          << " size=" << pkt->size << "（第" << output_frame_count << "帧）\n";
+            if (output_frame_count % 50 == 0) {
+                Logger::debug("VideoEncoder", std::string("编码MPEG4 Packet: pts=")
+                              + std::to_string(pkt->pts) + " size=" + std::to_string(pkt->size)
+                              + "（第" + std::to_string(output_frame_count) + "帧）");
             }
 
             out_q.push(*pkt);
@@ -172,7 +232,7 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
 
         // ========== 慢放: 复制帧 ==========
         if (speed < 1.0) {
-            double repeats = 1.0 / speed; // 0.5x → 2 repeats, 0.75x → 1.333 repeats
+            double repeats = 1.0 / speed;
             int repeat_count = static_cast<int>(std::round(repeats));
             if (repeat_count < 1) repeat_count = 1;
 
@@ -200,12 +260,13 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
         av_frame_unref(local_frame.get());
     }
 
-    std::cout << "[VideoEncoder Info] 开始刷新编码器剩余数据（输入" << input_frame_count
-              << "帧，输出" << output_frame_count << "帧）\n";
+    Logger::info("VideoEncoder", std::string("开始刷新编码器剩余数据（输入")
+                 + std::to_string(input_frame_count) + "帧，输出"
+                 + std::to_string(output_frame_count) + "帧）");
     ret = avcodec_send_frame(enc_ctx.get(), nullptr);
     if (ret < 0) {
         av_strerror(ret, err_buf, sizeof(err_buf));
-        std::cerr << "[VideoEncoder Warn] 刷新编码器失败：" << err_buf << "\n";
+        Logger::warn("VideoEncoder", std::string("刷新编码器失败：") + err_buf);
     }
 
     while (true) {
@@ -213,7 +274,7 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) break;
         if (ret < 0) {
             av_strerror(ret, err_buf, sizeof(err_buf));
-            std::cerr << "[VideoEncoder Warn] 刷新时接收编码包失败：" << err_buf << "\n";
+            Logger::warn("VideoEncoder", std::string("刷新时接收编码包失败：") + err_buf);
             break;
         }
 
@@ -224,6 +285,7 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
     }
 
     out_q.mark_done();
-    std::cout << "[VideoEncoder Info] 视频编码线程退出，输入" << input_frame_count
-              << "帧，输出" << output_frame_count << "帧\n";
+    Logger::info("VideoEncoder", std::string("视频编码线程退出，输入")
+                 + std::to_string(input_frame_count) + "帧，输出"
+                 + std::to_string(output_frame_count) + "帧");
 }
