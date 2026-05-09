@@ -118,6 +118,7 @@ void video_decode_thread(AVCodecParameters* codec_par,
 
         while (avcodec_receive_frame(codec_ctx.get(), frame.get()) >= 0) {
             frame_count++;
+            if (pipeline) pipeline->video_decoded_frames++;
             if (frame_count % 100 == 0) {
                 Logger::debug("VideoDecoder", std::string("解码YUV帧: pts=")
                               + std::to_string(frame->pts) + " width=" + std::to_string(frame->width)

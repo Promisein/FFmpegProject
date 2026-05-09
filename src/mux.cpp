@@ -71,9 +71,6 @@ void mux_thread(const std::string& output_file,
         return;
     }
 
-    if (video_stream->codecpar->codec_tag == 0) {
-        video_stream->codecpar->codec_tag = 0x7634706d;
-    }
     video_stream->time_base = output_time_base;
 
     Logger::info("Mux", std::string("视频流配置: 分辨率=")
@@ -168,7 +165,9 @@ void mux_thread(const std::string& output_file,
                     audio_pkt->stream_index = audio_stream->index;
 
                     if (audio_pkt->duration <= 0) {
-                        audio_pkt->duration = 1536;
+                        int frame_size = audio_stream->codecpar->frame_size;
+                        if (frame_size <= 0) frame_size = 1024;
+                        audio_pkt->duration = frame_size;
                     }
 
                     audio_pkt->pts = av_rescale_q(audio_accumulated_samples,

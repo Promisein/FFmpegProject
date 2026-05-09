@@ -115,6 +115,7 @@ void audio_decode_thread(AVCodecParameters* codec_par,
 
         while (avcodec_receive_frame(codec_ctx.get(), frame.get()) >= 0) {
             frame_count++;
+            if (pipeline) pipeline->audio_decoded_frames++;
             if (frame_count % 100 == 0) {
                 Logger::debug("AudioDecoder", std::string("解码PCM帧: pts=")
                               + std::to_string(frame->pts) + " channels=" + std::to_string(frame->channels)

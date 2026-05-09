@@ -14,6 +14,7 @@ extern "C" {
 #include <libavutil/avutil.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/error.h>
+#include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 }
 
@@ -34,9 +35,24 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
         return;
     }
 
-    const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_MPEG4);
+    // 编码器选择
+    AVCodecID codec_id;
+    const char* codec_name = "";
+    switch (config.video_codec) {
+        case VIDEO_CODEC_H264:
+            codec_id = AV_CODEC_ID_H264;
+            codec_name = "H264";
+            break;
+        case VIDEO_CODEC_MPEG4:
+        default:
+            codec_id = AV_CODEC_ID_MPEG4;
+            codec_name = "MPEG4";
+            break;
+    }
+
+    const AVCodec* encoder = avcodec_find_encoder(codec_id);
     if (!encoder) {
-        if (pipeline) pipeline->report_error("[VideoEncoder] 找不到MPEG4编码器");
+        if (pipeline) pipeline->report_error(std::string("[VideoEncoder] 找不到") + codec_name + "编码器");
         return;
     }
 
@@ -69,7 +85,7 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
         return;
     }
 
-    enc_ctx->codec_id = AV_CODEC_ID_MPEG4;
+    enc_ctx->codec_id = codec_id;
     enc_ctx->width = enc_width;
     enc_ctx->height = enc_height;
     enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
@@ -78,7 +94,13 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
     enc_ctx->bit_rate = 1000000;
     enc_ctx->gop_size = 10;
     enc_ctx->max_b_frames = 0;
-    enc_ctx->codec_tag = 0x7634706d;
+
+    if (config.video_codec == VIDEO_CODEC_H264) {
+        enc_ctx->codec_tag = 0;
+        av_opt_set(enc_ctx->priv_data, "preset", "medium", 0);
+    } else {
+        enc_ctx->codec_tag = 0x7634706d;  // 'mp4v'
+    }
 
     char err_buf[1024];
     int ret = avcodec_open2(enc_ctx.get(), encoder, nullptr);
@@ -88,7 +110,7 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
         return;
     }
 
-    Logger::info("VideoEncoder", "MPEG4编码器打开成功");
+    Logger::info("VideoEncoder", std::string(codec_name) + "编码器打开成功");
 
     FramePtr local_frame(av_frame_alloc());
     PacketPtr pkt(av_packet_alloc());
@@ -221,7 +243,7 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
             av_packet_rescale_ts(pkt.get(), enc_ctx->time_base, output_time_base);
 
             if (output_frame_count % 50 == 0) {
-                Logger::debug("VideoEncoder", std::string("编码MPEG4 Packet: pts=")
+                Logger::debug("VideoEncoder", std::string("编码") + codec_name + " Packet: pts="
                               + std::to_string(pkt->pts) + " size=" + std::to_string(pkt->size)
                               + "（第" + std::to_string(output_frame_count) + "帧）");
             }
@@ -285,6 +307,7 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
     }
 
     out_q.mark_done();
+    if (pipeline) pipeline->video_encoded_frames.store(output_frame_count, std::memory_order_release);
     Logger::info("VideoEncoder", std::string("视频编码线程退出，输入")
                  + std::to_string(input_frame_count) + "帧，输出"
                  + std::to_string(output_frame_count) + "帧");

@@ -239,9 +239,22 @@
 
 | 类型 | 编码 | 像素/采样格式 | 码率 | 其他 |
 |------|------|---------------|------|------|
-| 视频 | **MPEG4** (`AV_CODEC_ID_MPEG4`) | YUV420P | 1 Mbps | GOP=10, B-frames=0, `codec_tag=0x7634706d` |
-| 音频 | **AC3** (`AV_CODEC_ID_AC3`) | FLTP | 128 kbps | 固定 1536 采样/帧 |
+| 视频 | **MPEG4** / **H.264** | YUV420P | 1 Mbps | MPEG4: GOP=10, B-frames=0, `codec_tag=0x7634706d`; H.264: preset=medium |
+| 音频 | **AC3** / **AAC** | FLTP | 128 kbps | AC3: 1536 采样/帧; AAC: 1024 采样/帧（动态读取） |
 | 容器 | **MP4** | - | - | - |
+
+### 单元测试
+
+```bash
+cd build
+cmake .. -G "MinGW Makefiles"
+cmake --build .
+PATH="<ffmpeg>/bin:$PATH" ./FFmpegProject_tests.exe
+```
+
+- **16 个 Google Test 用例**：PacketQueue (3), RingBuffer (3), DeepCopyPacketQueue (3), VideoRotateProcessor (7)
+- **旋转测试**：90°/180°/270° 像素级旋转验证 + 分辨率计算 + 不支持格式边界测试
+- **队列测试**：FIFO 顺序、多生产者-消费者、满阻塞生产者、flush 唤醒生产者、深拷贝完整性、EOF 信号
 
 ### 目录结构
 
@@ -266,6 +279,7 @@ FFmpegProject/
 ├── src/                            # 各模块实现
 │   ├── logger.cpp                  # 日志系统实现
 ├── input/                          # 输入文件目录 (扫描 *.mp4)
+├── tests/                          # Google Test 单元测试
 ├── output/<filename>/              # 输出目录 (每个文件独立子目录)
 ├── ffmpeg-4.4-full_build-shared/   # FFmpeg 4.4 共享库
 └── README.md
@@ -291,17 +305,20 @@ PATH="<ffmpeg>/bin:$PATH" ./FFmpegProject -rotate 90 -speed 1.5 -threads 3
 ### CLI 用法
 
 ```
-FFmpegProject [-rotate <angle>] [-speed <ratio>] [-threads <n>]
+FFmpegProject [-rotate <angle>] [-speed <ratio>] [-threads <n>] [-vcodec h264|mpeg4] [-acodec aac|ac3]
   -rotate <angle>  视频旋转: 90, 180, 270
   -speed  <ratio>  播放速度: 0.5, 0.75, 1.25, 1.5, 2, 4
   -threads <n>     线程池并发数 (默认 3)
+  -vcodec <name>   视频编码器: h264, mpeg4（默认 mpeg4）
+  -acodec <name>   音频编码器: aac, ac3（默认 ac3）
 
 自动扫描 ../input/*.mp4，输出到 ../output/<文件名>/output.mp4
 
 示例:
-  ./FFmpegProject                                    # 默认参数，单文件
-  ./FFmpegProject -rotate 90 -speed 1.5              # 旋转90° + 1.5倍速
-  ./FFmpegProject -rotate 180 -speed 0.5 -threads 4  # 旋转180° + 0.5倍速 + 4并发
+  ./FFmpegProject                                             # 默认参数 (MPEG4+AC3)
+  ./FFmpegProject -rotate 90 -speed 1.5                       # 旋转90° + 1.5倍速
+  ./FFmpegProject -vcodec h264 -acodec aac                    # H.264 + AAC 编码
+  ./FFmpegProject -vcodec h264 -rotate 90 -speed 1.5 -threads 2  # 全参数组合
 ```
 
 ### 技术栈
@@ -548,9 +565,22 @@ Audio PTS is independently calculated from accumulated sample count (`audio_accu
 
 | Type | Codec | Format | Bitrate | Notes |
 |------|-------|--------|---------|-------|
-| Video | **MPEG4** (`AV_CODEC_ID_MPEG4`) | YUV420P | 1 Mbps | GOP=10, B-frames=0, `codec_tag=0x7634706d` |
-| Audio | **AC3** (`AV_CODEC_ID_AC3`) | FLTP | 128 kbps | Fixed 1536 samples/frame |
+| Video | **MPEG4** / **H.264** | YUV420P | 1 Mbps | MPEG4: GOP=10, B-frames=0, `codec_tag=0x7634706d`; H.264: preset=medium |
+| Audio | **AC3** / **AAC** | FLTP | 128 kbps | AC3: 1536 samples/frame; AAC: 1024 samples/frame (dynamic read) |
 | Container | **MP4** | - | - | - |
+
+### Unit Tests
+
+```bash
+cd build
+cmake .. -G "MinGW Makefiles"
+cmake --build .
+PATH="<ffmpeg>/bin:$PATH" ./FFmpegProject_tests.exe
+```
+
+- **16 Google Test cases**: PacketQueue (3), RingBuffer (3), DeepCopyPacketQueue (3), VideoRotateProcessor (7)
+- **Rotation tests**: 90/180/270 pixel-level rotation verification + dimension calculation + unsupported format edge case
+- **Queue tests**: FIFO ordering, multi-producer-consumer, full-block-producer, flush-unblock-producer, deep-copy integrity, EOF signal
 
 ### Directory Structure
 
@@ -575,6 +605,7 @@ FFmpegProject/
 ├── src/                            # Module implementations
 │   ├── logger.cpp                  # Logger implementation
 ├── input/                          # Input files directory (scans *.mp4)
+├── tests/                          # Google Test unit tests
 ├── output/<filename>/              # Output directory (per-file subdir)
 ├── ffmpeg-4.4-full_build-shared/   # FFmpeg 4.4 shared libraries
 └── README.md
@@ -598,17 +629,20 @@ PATH="<ffmpeg>/bin:$PATH" ./FFmpegProject -rotate 90 -speed 1.5 -threads 3
 ### CLI Usage
 
 ```
-FFmpegProject [-rotate <angle>] [-speed <ratio>] [-threads <n>]
+FFmpegProject [-rotate <angle>] [-speed <ratio>] [-threads <n>] [-vcodec h264|mpeg4] [-acodec aac|ac3]
   -rotate <angle>  Video rotation: 90, 180, 270
   -speed  <ratio>  Playback speed: 0.5, 0.75, 1.25, 1.5, 2, 4
   -threads <n>     Thread pool concurrency (default: 3)
+  -vcodec <name>   Video codec: h264, mpeg4 (default: mpeg4)
+  -acodec <name>   Audio codec: aac, ac3 (default: ac3)
 
 Auto-scans ../input/*.mp4, outputs to ../output/<filename>/output.mp4
 
 Examples:
-  ./FFmpegProject                                    # Default, single file
-  ./FFmpegProject -rotate 90 -speed 1.5              # 90° rotate + 1.5x speed
-  ./FFmpegProject -rotate 180 -speed 0.5 -threads 4  # 180° rotate + 0.5x speed + 4 workers
+  ./FFmpegProject                                             # Default (MPEG4+AC3)
+  ./FFmpegProject -rotate 90 -speed 1.5                       # 90° rotate + 1.5x speed
+  ./FFmpegProject -vcodec h264 -acodec aac                    # H.264 + AAC encoding
+  ./FFmpegProject -vcodec h264 -rotate 90 -speed 1.5 -threads 2  # Full combo
 ```
 
 ### Tech Stack
@@ -621,6 +655,16 @@ Examples:
 ---
 
 ## 更新日志 / Changelog
+
+### 2026-05-09 — v0.4.0 (P1 多编码器 + 单元测试 + 进度反馈)
+
+| 模块 | 内容 |
+|------|------|
+| **多编码器支持** | `-vcodec h264\|mpeg4` / `-acodec aac\|ac3` CLI 参数。H.264 编码（`av_opt_set preset=medium`），AAC 编码（动态读取 `frame_size=1024`），编码参数按 codec 动态设置 |
+| **FPS 性能基准** | `Pipeline` 新增 6 个 `atomic<int64_t>` 帧计数器（解封装/解码/编码），`transcode_single()` 记录 wall-clock 时间并计算各阶段 FPS |
+| **进度反馈** | `Pipeline` 新增 `atomic<double> progress`，解封装线程按 PTS/duration 计算进度（0.0~1.0），每 10% 日志输出；PTS 不可用时回退字节位置估算 |
+| **单元测试 (Google Test)** | `tests/test_queues.cpp`（8 用例：PacketQueue FIFO/阻塞/多生产者、RingBuffer FIFO/满阻塞/flush唤醒、DeepCopyPacketQueue 深拷贝/EOF）、`tests/test_rotation.cpp`（7 用例：90/180/270 像素验证 + 分辨率计算 + 不支持格式 + isFormatSupported） |
+| **CMake 测试集成** | `CMakeLists.txt` — FetchContent 下载 Google Test v1.14.0，`FFmpegProject_tests` 目标，CTest 注册，`cmake --build .` 一键编译 |
 
 ### 2026-05-09 — v0.3.0 (P0 基础能力补齐)
 

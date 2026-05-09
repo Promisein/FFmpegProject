@@ -18,7 +18,7 @@ extern "C" {
 #include <libswresample/swresample.h>
 }
 
-#define AC3_REQUIRED_NB_SAMPLES 1536
+// frame_size 在开编码器后动态读取（AC3=1536, AAC=1024）
 
 // SwrContext RAII 包装
 struct SwrContextDeleter {
@@ -42,9 +42,24 @@ void audio_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
         Logger::info("AudioEncoder", std::string("倍速: ") + std::to_string(speed) + "x");
     }
 
-    const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_AC3);
+    // 编码器选择
+    AVCodecID codec_id;
+    const char* codec_name = "";
+    switch (config.audio_codec) {
+        case AUDIO_CODEC_AAC:
+            codec_id = AV_CODEC_ID_AAC;
+            codec_name = "AAC";
+            break;
+        case AUDIO_CODEC_AC3:
+        default:
+            codec_id = AV_CODEC_ID_AC3;
+            codec_name = "AC3";
+            break;
+    }
+
+    const AVCodec* encoder = avcodec_find_encoder(codec_id);
     if (!encoder) {
-        if (pipeline) pipeline->report_error("[AudioEncoder] 找不到AC3编码器");
+        if (pipeline) pipeline->report_error(std::string("[AudioEncoder] 找不到") + codec_name + "编码器");
         return;
     }
 
@@ -54,14 +69,14 @@ void audio_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
         return;
     }
 
-    enc_ctx->codec_id = AV_CODEC_ID_AC3;
+    enc_ctx->codec_id = codec_id;
     enc_ctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
     enc_ctx->sample_rate = src_codec_par->sample_rate;
     enc_ctx->channel_layout = av_get_default_channel_layout(src_codec_par->channels);
     enc_ctx->channels = src_codec_par->channels;
     enc_ctx->bit_rate = 128000;
     enc_ctx->time_base = (AVRational){1, enc_ctx->sample_rate};
-    enc_ctx->frame_size = AC3_REQUIRED_NB_SAMPLES;
+    // frame_size 在 avcodec_open2 后动态读取
 
     char err_buf[1024];
     int ret = avcodec_open2(enc_ctx.get(), encoder, nullptr);
@@ -71,10 +86,18 @@ void audio_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
         return;
     }
 
-    Logger::info("AudioEncoder", std::string("AC3编码器打开成功（采样率：")
+    // 读取编码器实际 frame_size
+    int required_nb_samples = enc_ctx->frame_size;
+    if (required_nb_samples <= 0) {
+        required_nb_samples = (config.audio_codec == AUDIO_CODEC_AC3) ? 1536 : 1024;
+        Logger::warn("AudioEncoder", std::string("编码器未报告frame_size，使用默认值: ")
+                     + std::to_string(required_nb_samples));
+    }
+
+    Logger::info("AudioEncoder", std::string(codec_name) + "编码器打开成功（采样率："
                  + std::to_string(enc_ctx->sample_rate)
                  + "，声道数：" + std::to_string(enc_ctx->channels)
-                 + "，帧大小：" + std::to_string(enc_ctx->frame_size) + "）");
+                 + "，帧大小：" + std::to_string(required_nb_samples) + "）");
 
     FramePtr input_frame(av_frame_alloc());
     FramePtr encode_frame(av_frame_alloc());
@@ -89,7 +112,7 @@ void audio_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
     encode_frame->sample_rate = enc_ctx->sample_rate;
     encode_frame->channel_layout = enc_ctx->channel_layout;
     encode_frame->channels = enc_ctx->channels;
-    encode_frame->nb_samples = AC3_REQUIRED_NB_SAMPLES;
+    encode_frame->nb_samples = required_nb_samples;
 
     ret = av_frame_get_buffer(encode_frame.get(), 0);
     if (ret < 0) {
@@ -203,7 +226,7 @@ void audio_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
         }
 
         int src_nb = source_frame->nb_samples;
-        int dst_nb = AC3_REQUIRED_NB_SAMPLES;
+        int dst_nb = required_nb_samples;
         int copy_nb = (src_nb < dst_nb) ? src_nb : dst_nb;
 
         // 如果重采样后 bytes_per_sample 可能改变，重新获取
@@ -310,6 +333,7 @@ void audio_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
     }
 
     out_q.mark_done();
+    if (pipeline) pipeline->audio_encoded_frames.store(output_frame_count, std::memory_order_release);
     Logger::info("AudioEncoder", std::string("音频编码线程退出，输入")
                  + std::to_string(input_frame_count) + "帧，输出"
                  + std::to_string(output_frame_count) + "帧");

@@ -5,6 +5,7 @@
 #include <vector>
 #include <algorithm>
 #include <sstream>
+#include <chrono>
 #include <filesystem>
 #include "demux.h"
 #include "videodecoder.h"
@@ -84,25 +85,32 @@ TranscodeResult transcode_single(const std::string& input_path,
         std::swap(out_width, out_height);
     }
 
-    // MPEG4 编码参数
-    CodecParametersPtr mpeg4_params(avcodec_parameters_alloc());
-    mpeg4_params->codec_type = AVMEDIA_TYPE_VIDEO;
-    mpeg4_params->codec_id = AV_CODEC_ID_MPEG4;
-    mpeg4_params->codec_tag = 0x7634706d;
-    mpeg4_params->width = out_width;
-    mpeg4_params->height = out_height;
-    mpeg4_params->format = AV_PIX_FMT_YUV420P;
-    mpeg4_params->bit_rate = 1000000;
+    // 视频编码参数（根据 codec 动态设置）
+    CodecParametersPtr video_enc_params(avcodec_parameters_alloc());
+    video_enc_params->codec_type = AVMEDIA_TYPE_VIDEO;
+    video_enc_params->width = out_width;
+    video_enc_params->height = out_height;
+    video_enc_params->format = AV_PIX_FMT_YUV420P;
+    video_enc_params->bit_rate = 1000000;
 
-    // AC3 编码参数
-    CodecParametersPtr ac3_params(avcodec_parameters_alloc());
-    ac3_params->codec_type = AVMEDIA_TYPE_AUDIO;
-    ac3_params->codec_id = AV_CODEC_ID_AC3;
-    ac3_params->sample_rate = audio_dec_par->sample_rate;
-    ac3_params->channels = audio_dec_par->channels;
-    ac3_params->channel_layout = av_get_default_channel_layout(audio_dec_par->channels);
-    ac3_params->format = AV_SAMPLE_FMT_FLTP;
-    ac3_params->bit_rate = 128000;
+    if (config.video_codec == VIDEO_CODEC_H264) {
+        video_enc_params->codec_id = AV_CODEC_ID_H264;
+        video_enc_params->codec_tag = 0;
+    } else {
+        video_enc_params->codec_id = AV_CODEC_ID_MPEG4;
+        video_enc_params->codec_tag = 0x7634706d;  // 'mp4v'
+    }
+
+    // 音频编码参数（根据 codec 动态设置）
+    CodecParametersPtr audio_enc_params(avcodec_parameters_alloc());
+    audio_enc_params->codec_type = AVMEDIA_TYPE_AUDIO;
+    audio_enc_params->sample_rate = audio_dec_par->sample_rate;
+    audio_enc_params->channels = audio_dec_par->channels;
+    audio_enc_params->channel_layout = av_get_default_channel_layout(audio_dec_par->channels);
+    audio_enc_params->format = AV_SAMPLE_FMT_FLTP;
+    audio_enc_params->bit_rate = 128000;
+    audio_enc_params->codec_id = (config.audio_codec == AUDIO_CODEC_AAC)
+        ? AV_CODEC_ID_AAC : AV_CODEC_ID_AC3;
 
     // 输出时间基
     AVRational input_frame_rate = fmt_ctx->streams[video_stream_idx]->r_frame_rate;
@@ -113,6 +121,9 @@ TranscodeResult transcode_single(const std::string& input_path,
 
     // 创建独立的 Pipeline（每个任务有自己的一套队列）
     Pipeline pipeline;
+
+    // 启动计时
+    auto start_time = std::chrono::steady_clock::now();
 
     // 启动 6 个转码线程
     std::thread demux_th(demux_thread,
@@ -140,7 +151,7 @@ TranscodeResult transcode_single(const std::string& input_path,
                              config, &pipeline);
 
     std::thread mux_th(mux_thread, output_file,
-                       mpeg4_params.get(), ac3_params.get(), output_time_base,
+                       video_enc_params.get(), audio_enc_params.get(), output_time_base,
                        std::ref(pipeline.en_video_pkt_queue),
                        std::ref(pipeline.en_audio_pkt_queue),
                        config, &pipeline);
@@ -152,6 +163,23 @@ TranscodeResult transcode_single(const std::string& input_path,
     video_enc_th.join();
     audio_enc_th.join();
     mux_th.join();
+
+    auto end_time = std::chrono::steady_clock::now();
+    double elapsed_s = std::chrono::duration<double>(end_time - start_time).count();
+
+    // FPS 统计
+    if (elapsed_s > 0) {
+        int64_t vdec = pipeline.video_decoded_frames.load(std::memory_order_acquire);
+        int64_t adec = pipeline.audio_decoded_frames.load(std::memory_order_acquire);
+        int64_t venc = pipeline.video_encoded_frames.load(std::memory_order_acquire);
+        int64_t aenc = pipeline.audio_encoded_frames.load(std::memory_order_acquire);
+        Logger::info("main", std::string("性能统计 (耗时 ") + std::to_string(elapsed_s) + "s):");
+        Logger::info("main", std::string("  视频解码=") + std::to_string(static_cast<int>(vdec / elapsed_s))
+                     + " fps, 音频解码=" + std::to_string(static_cast<int>(adec / elapsed_s))
+                     + " fps");
+        Logger::info("main", std::string("  视频编码=") + std::to_string(static_cast<int>(venc / elapsed_s))
+                     + " fps, 音频编码=" + std::to_string(static_cast<int>(aenc / elapsed_s)) + " fps");
+    }
 
     if (pipeline.has_error()) {
         result.success = false;
@@ -168,12 +196,15 @@ TranscodeResult transcode_single(const std::string& input_path,
 void print_usage(const char* prog) {
     std::ostringstream usage;
     usage << "用法: " << prog << " [-rotate <angle>] [-speed <ratio>] [-threads <n>]\n"
+          << "       [-vcodec h264|mpeg4] [-acodec aac|ac3]\n"
           << "  -rotate <angle>  视频旋转: 90, 180, 270\n"
           << "  -speed  <ratio>  播放速度: 0.5, 0.75, 1.25, 1.5, 2, 4\n"
           << "  -threads <n>     线程池并发数（默认 3）\n"
+          << "  -vcodec <name>   视频编码器: h264, mpeg4（默认 mpeg4）\n"
+          << "  -acodec <name>   音频编码器: aac, ac3（默认 ac3）\n"
           << "\n"
           << "自动扫描 ../input/*.mp4，输出到 ../output/<文件名>/\n"
-          << "示例: " << prog << " -rotate 90 -speed 1.5 -threads 4";
+          << "示例: " << prog << " -vcodec h264 -acodec aac -rotate 90 -speed 1.5 -threads 4";
     Logger::info("usage", usage.str());
 }
 
@@ -204,6 +235,26 @@ int main(int argc, char* argv[]) {
         } else if (std::strcmp(argv[i], "-threads") == 0 && i + 1 < argc) {
             pool_size = std::stoi(argv[++i]);
             if (pool_size < 1) pool_size = 1;
+        } else if (std::strcmp(argv[i], "-vcodec") == 0 && i + 1 < argc) {
+            ++i;
+            if (std::strcmp(argv[i], "h264") == 0)
+                config.video_codec = VIDEO_CODEC_H264;
+            else if (std::strcmp(argv[i], "mpeg4") == 0)
+                config.video_codec = VIDEO_CODEC_MPEG4;
+            else {
+                Logger::error("main", std::string("不支持的视频编码器: ") + argv[i]);
+                return 1;
+            }
+        } else if (std::strcmp(argv[i], "-acodec") == 0 && i + 1 < argc) {
+            ++i;
+            if (std::strcmp(argv[i], "aac") == 0)
+                config.audio_codec = AUDIO_CODEC_AAC;
+            else if (std::strcmp(argv[i], "ac3") == 0)
+                config.audio_codec = AUDIO_CODEC_AC3;
+            else {
+                Logger::error("main", std::string("不支持的音频编码器: ") + argv[i]);
+                return 1;
+            }
         } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -216,7 +267,9 @@ int main(int argc, char* argv[]) {
 
     Logger::info("Main", std::string("配置: 旋转=") + std::to_string(config.rotate)
                  + "度, 倍速=" + std::to_string(config.speed_ratio)
-                 + "x, 线程池=" + std::to_string(pool_size));
+                 + "x, 线程池=" + std::to_string(pool_size)
+                 + ", 视频编码器=" + (config.video_codec == VIDEO_CODEC_H264 ? "h264" : "mpeg4")
+                 + ", 音频编码器=" + (config.audio_codec == AUDIO_CODEC_AAC ? "aac" : "ac3"));
 
     avformat_network_init();
 
