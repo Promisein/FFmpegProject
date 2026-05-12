@@ -91,16 +91,28 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
     enc_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
     enc_ctx->time_base = output_time_base;
     enc_ctx->framerate = av_inv_q(output_time_base);
-    enc_ctx->bit_rate = 1000000;
     enc_ctx->gop_size = 10;
     enc_ctx->max_b_frames = 0;
+
+    // 动态码率: 根据分辨率×帧率计算，避免画质损失
+    double fps_val = av_q2d(av_inv_q(output_time_base));
+    double pixels_per_sec = enc_width * enc_height * fps_val;
+    int64_t dynamic_bitrate = static_cast<int64_t>(pixels_per_sec * 0.12);
+    if (dynamic_bitrate < 2000000) dynamic_bitrate = 2000000;
 
     if (config.video_codec == VIDEO_CODEC_H264) {
         enc_ctx->codec_tag = 0;
         av_opt_set(enc_ctx->priv_data, "preset", "medium", 0);
+        av_opt_set(enc_ctx->priv_data, "crf", "23", 0);
     } else {
         enc_ctx->codec_tag = 0x7634706d;  // 'mp4v'
+        enc_ctx->bit_rate = dynamic_bitrate;
     }
+
+    Logger::info("VideoEncoder", std::string("编码参数: ") + codec_name
+                 + (config.video_codec == VIDEO_CODEC_H264
+                    ? " CRF=23" : (" 码率=" + std::to_string(dynamic_bitrate / 1000) + "kbps"))
+                 + ", 分辨率=" + std::to_string(enc_width) + "x" + std::to_string(enc_height));
 
     char err_buf[1024];
     int ret = avcodec_open2(enc_ctx.get(), encoder, nullptr);
@@ -164,7 +176,7 @@ void video_encode_thread(AVCodecParameters* src_codec_par, AVRational output_tim
                     frame_to_encode->width, frame_to_encode->height,
                     static_cast<AVPixelFormat>(frame_to_encode->format),
                     enc_width, enc_height, AV_PIX_FMT_YUV420P,
-                    SWS_BILINEAR, nullptr, nullptr, nullptr));
+                    SWS_LANCZOS, nullptr, nullptr, nullptr));
                 if (!sws_ctx) {
                     Logger::error("VideoEncoder", "创建SwsContext失败");
                     av_frame_unref(local_frame.get());
